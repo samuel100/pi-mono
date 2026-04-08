@@ -11,7 +11,7 @@
  *   - Pi's existing openai-completions provider handles SSE and tool calling.
  */
 
-import { fork } from "node:child_process";
+import { type ChildProcess, fork, spawn } from "node:child_process";
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import { createRequire } from "node:module";
 import { join } from "node:path";
@@ -274,17 +274,34 @@ export class FoundryLocalProvider {
 	}
 
 	private async spawnService(): Promise<string> {
-		const servicePath = join(__dirname, "foundry-local-service.js");
+		// Resolve the service script path. When running from source (tsx), __dirname
+		// points to the .ts source. When running compiled, it points to dist/.
+		// We try the .js path first (compiled), then fall back to .ts via tsx.
+		const jsPath = join(__dirname, "foundry-local-service.js");
+		const tsPath = join(__dirname, "foundry-local-service.ts");
+		const useTs = !existsSync(jsPath) && existsSync(tsPath);
+		const servicePath = useTs ? tsPath : jsPath;
 
 		return new Promise<string>((resolve, reject) => {
 			const timeout = setTimeout(() => {
 				reject(new Error(`Foundry Local service did not start within ${SERVICE_START_TIMEOUT_MS / 1000}s`));
 			}, SERVICE_START_TIMEOUT_MS);
 
-			const child = fork(servicePath, [this.lockfilePath], {
-				detached: true,
-				stdio: ["ignore", "pipe", "ignore", "ipc"],
-			});
+			let child: ChildProcess;
+			if (useTs) {
+				// Running from source — use tsx to execute the TypeScript service
+				const tsxBin = join(__dirname, "..", "..", "..", "..", "node_modules", ".bin", "tsx");
+				child = spawn(tsxBin, [servicePath, this.lockfilePath], {
+					detached: true,
+					stdio: ["ignore", "pipe", "ignore"],
+				});
+				child.unref();
+			} else {
+				child = fork(servicePath, [this.lockfilePath], {
+					detached: true,
+					stdio: ["ignore", "pipe", "ignore", "ipc"],
+				});
+			}
 
 			child.unref();
 
@@ -299,7 +316,7 @@ export class FoundryLocalProvider {
 						this.baseUrl = parsed.urls[0];
 						// Close stdout pipe and disconnect IPC so child is fully detached
 						child.stdout?.destroy();
-						child.disconnect?.();
+						if (typeof child.disconnect === "function") child.disconnect();
 						resolve(this.baseUrl!);
 					}
 				} catch {
