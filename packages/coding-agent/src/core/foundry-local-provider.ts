@@ -140,8 +140,9 @@ export class FoundryLocalProvider {
 
 		try {
 			const manager = await this.getOrCreateManager();
-			// Invalidate the catalog cache so isCached reflects current disk state
-			manager.catalog.invalidateCache();
+			// Reset the catalog's time-based cache so isCached reflects current disk state.
+			// The catalog caches for 6 hours; we need fresh data each time the selector opens.
+			(manager.catalog as any).lastFetch = 0;
 			const models = await manager.catalog.getModels();
 			return models.map((m: any) => ({
 				alias: m.alias,
@@ -166,8 +167,7 @@ export class FoundryLocalProvider {
 	 */
 	async downloadModel(alias: string, onProgress?: (percent: number) => void): Promise<void> {
 		const manager = await this.getOrCreateManager();
-		// Invalidate cache to get fresh isCached status
-		manager.catalog.invalidateCache();
+		(manager.catalog as any).lastFetch = 0;
 		const model = await manager.catalog.getModel(alias);
 		if (!model.isCached) {
 			await model.download(onProgress);

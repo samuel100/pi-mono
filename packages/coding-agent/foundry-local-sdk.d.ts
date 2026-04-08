@@ -39,7 +39,6 @@ declare module "foundry-local-sdk" {
 	}
 
 	export class Catalog {
-		invalidateCache(): void;
 		getModels(): Promise<IModel[]>;
 		getModel(alias: string): Promise<IModel>;
 		getCachedModels(): Promise<IModel[]>;
