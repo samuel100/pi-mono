@@ -66,6 +66,7 @@ export class ModelSelectorComponent extends Container implements Focusable {
 	private statusText?: Text;
 	private downloading: boolean = false;
 	private localModelInfoMap: Map<string, LocalModelInfo> = new Map();
+	private loadedLocalModels: Set<string> = new Set();
 
 	constructor(
 		tui: TUI,
@@ -178,6 +179,10 @@ export class ModelSelectorComponent extends Container implements Focusable {
 				for (const info of catalogModels) {
 					this.localModelInfoMap.set(info.alias, info);
 				}
+
+				// Query which models are currently loaded on the service
+				this.loadedLocalModels = new Set(await fl.listLoadedModels());
+
 				// Attach localInfo to any Foundry Local models already in the list
 				for (const item of models) {
 					if (item.provider === FOUNDRY_LOCAL_PROVIDER) {
@@ -223,12 +228,39 @@ export class ModelSelectorComponent extends Container implements Focusable {
 
 	private sortModels(models: ModelItem[]): ModelItem[] {
 		const sorted = [...models];
-		// Sort: current model first, then by provider
+		// Sort priority: current model > loaded local > cached local > cloud models > uncached local
 		sorted.sort((a, b) => {
 			const aIsCurrent = modelsAreEqual(this.currentModel, a.model);
 			const bIsCurrent = modelsAreEqual(this.currentModel, b.model);
 			if (aIsCurrent && !bIsCurrent) return -1;
 			if (!aIsCurrent && bIsCurrent) return 1;
+
+			const aIsLocal = a.provider === FOUNDRY_LOCAL_PROVIDER;
+			const bIsLocal = b.provider === FOUNDRY_LOCAL_PROVIDER;
+
+			// Local models with cache state sort above uncached local models
+			if (aIsLocal && bIsLocal) {
+				const aLoaded = this.loadedLocalModels.has(a.id);
+				const bLoaded = this.loadedLocalModels.has(b.id);
+				if (aLoaded && !bLoaded) return -1;
+				if (!aLoaded && bLoaded) return 1;
+
+				const aCached = a.localInfo?.isCached ?? false;
+				const bCached = b.localInfo?.isCached ?? false;
+				if (aCached && !bCached) return -1;
+				if (!aCached && bCached) return 1;
+
+				return a.id.localeCompare(b.id);
+			}
+
+			// Cached local models sort above cloud models; uncached sort below
+			if (aIsLocal && !bIsLocal) {
+				return a.localInfo?.isCached || this.loadedLocalModels.has(a.id) ? -1 : 1;
+			}
+			if (!aIsLocal && bIsLocal) {
+				return b.localInfo?.isCached || this.loadedLocalModels.has(b.id) ? 1 : -1;
+			}
+
 			return a.provider.localeCompare(b.provider);
 		});
 		return sorted;
@@ -290,11 +322,12 @@ export class ModelSelectorComponent extends Container implements Focusable {
 			// Build status suffix for local models
 			let statusSuffix = "";
 			if (isLocal && localInfo) {
-				if (localInfo.isCached) {
-					statusSuffix = theme.fg("success", " ✓");
+				if (this.loadedLocalModels.has(item.id)) {
+					statusSuffix = theme.fg("success", " ✓ loaded");
+				} else if (localInfo.isCached) {
+					statusSuffix = theme.fg("success", " ● cached");
 				} else {
-					const size = localInfo.fileSizeMb ? `${(localInfo.fileSizeMb / 1024).toFixed(1)} GB` : "";
-					statusSuffix = theme.fg("warning", ` ⬇ ${size}`);
+					statusSuffix = theme.fg("warning", " ⬇");
 				}
 			} else if (isCurrent) {
 				statusSuffix = theme.fg("success", " ✓");
