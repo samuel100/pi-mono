@@ -24,6 +24,7 @@ import { existsSync, readFileSync } from "fs";
 import { join } from "path";
 import { getAgentDir } from "../config.js";
 import type { AuthStorage } from "./auth-storage.js";
+import { FOUNDRY_LOCAL_PROVIDER, FoundryLocalProvider } from "./foundry-local-provider.js";
 import {
 	clearConfigValueCache,
 	resolveConfigValueOrThrow,
@@ -258,6 +259,7 @@ export class ModelRegistry {
 	private modelRequestHeaders: Map<string, Record<string, string>> = new Map();
 	private registeredProviders: Map<string, ProviderConfigInput> = new Map();
 	private loadError: string | undefined = undefined;
+	private _foundryLocal: FoundryLocalProvider | undefined;
 
 	private constructor(
 		readonly authStorage: AuthStorage,
@@ -272,6 +274,14 @@ export class ModelRegistry {
 
 	static inMemory(authStorage: AuthStorage): ModelRegistry {
 		return new ModelRegistry(authStorage, undefined);
+	}
+
+	/** Get the Foundry Local provider instance (lazy-created). */
+	get foundryLocal(): FoundryLocalProvider {
+		if (!this._foundryLocal) {
+			this._foundryLocal = new FoundryLocalProvider(getAgentDir());
+		}
+		return this._foundryLocal;
 	}
 
 	/**
@@ -517,6 +527,19 @@ export class ModelRegistry {
 	}
 
 	/**
+	 * Set Foundry Local models in the registry.
+	 * Replaces any previously registered Foundry Local models.
+	 */
+	setFoundryLocalModels(models: Model<Api>[]): void {
+		// Remove existing foundry-local models
+		this.models = this.models.filter((m) => m.provider !== FOUNDRY_LOCAL_PROVIDER);
+		// Add new ones
+		this.models.push(...models);
+		// Set a sentinel apiKey so the provider passes auth checks
+		this.providerRequestConfigs.set(FOUNDRY_LOCAL_PROVIDER, { apiKey: "foundry-local" });
+	}
+
+	/**
 	 * Get only models that have auth configured.
 	 * This is a fast check that doesn't refresh OAuth tokens.
 	 */
@@ -535,6 +558,8 @@ export class ModelRegistry {
 	 * Get API key for a model.
 	 */
 	hasConfiguredAuth(model: Model<Api>): boolean {
+		// Foundry Local models are always available (no API key needed)
+		if (model.provider === FOUNDRY_LOCAL_PROVIDER) return true;
 		return (
 			this.authStorage.hasAuth(model.provider) ||
 			this.providerRequestConfigs.get(model.provider)?.apiKey !== undefined
@@ -577,6 +602,10 @@ export class ModelRegistry {
 	 * Get API key and request headers for a model.
 	 */
 	async getApiKeyAndHeaders(model: Model<Api>): Promise<ResolvedRequestAuth> {
+		// Foundry Local models don't need auth — return a sentinel key
+		if (model.provider === FOUNDRY_LOCAL_PROVIDER) {
+			return { ok: true, apiKey: "foundry-local", headers: undefined };
+		}
 		try {
 			const providerConfig = this.providerRequestConfigs.get(model.provider);
 			const apiKeyFromAuthStorage = await this.authStorage.getApiKey(model.provider, { includeFallback: false });

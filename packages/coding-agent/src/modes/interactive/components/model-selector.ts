@@ -9,6 +9,7 @@ import {
 	Text,
 	type TUI,
 } from "@mariozechner/pi-tui";
+import { FOUNDRY_LOCAL_PROVIDER, type LocalModelInfo } from "../../../core/foundry-local-provider.js";
 import type { ModelRegistry } from "../../../core/model-registry.js";
 import type { SettingsManager } from "../../../core/settings-manager.js";
 import { theme } from "../theme/theme.js";
@@ -19,6 +20,8 @@ interface ModelItem {
 	provider: string;
 	id: string;
 	model: Model<any>;
+	/** For Foundry Local models: cached/uncached state and size info */
+	localInfo?: LocalModelInfo;
 }
 
 interface ScopedModelItem {
@@ -60,6 +63,9 @@ export class ModelSelectorComponent extends Container implements Focusable {
 	private scope: ModelScope = "all";
 	private scopeText?: Text;
 	private scopeHintText?: Text;
+	private statusText?: Text;
+	private downloading: boolean = false;
+	private localModelInfoMap: Map<string, LocalModelInfo> = new Map();
 
 	constructor(
 		tui: TUI,
@@ -163,6 +169,41 @@ export class ModelSelectorComponent extends Container implements Focusable {
 			return;
 		}
 
+		// Load Foundry Local catalog models with download state
+		try {
+			const fl = this.modelRegistry.foundryLocal;
+			if (fl.isAvailable()) {
+				const catalogModels = await fl.getCatalogModels();
+				this.localModelInfoMap.clear();
+				for (const info of catalogModels) {
+					this.localModelInfoMap.set(info.alias, info);
+				}
+				// Attach localInfo to any Foundry Local models already in the list
+				for (const item of models) {
+					if (item.provider === FOUNDRY_LOCAL_PROVIDER) {
+						item.localInfo = this.localModelInfoMap.get(item.id);
+					}
+				}
+				// Add catalog models not yet registered (uncached models from full catalog)
+				const registeredIds = new Set(models.filter((m) => m.provider === FOUNDRY_LOCAL_PROVIDER).map((m) => m.id));
+				for (const info of catalogModels) {
+					if (!registeredIds.has(info.alias)) {
+						const piModels = fl.buildPiModels([info], fl.getBaseUrl() ?? "http://127.0.0.1:5273");
+						if (piModels.length > 0) {
+							models.push({
+								provider: FOUNDRY_LOCAL_PROVIDER,
+								id: info.alias,
+								model: piModels[0],
+								localInfo: info,
+							});
+						}
+					}
+				}
+			}
+		} catch {
+			// Foundry Local catalog unavailable — continue with cloud models only
+		}
+
 		this.allModels = this.sortModels(models);
 		this.scopedModels = this.scopedModels.map((scoped) => {
 			const refreshed = this.modelRegistry.find(scoped.model.provider, scoped.model.id);
@@ -243,19 +284,32 @@ export class ModelSelectorComponent extends Container implements Focusable {
 
 			const isSelected = i === this.selectedIndex;
 			const isCurrent = modelsAreEqual(this.currentModel, item.model);
+			const isLocal = item.provider === FOUNDRY_LOCAL_PROVIDER;
+			const localInfo = item.localInfo;
+
+			// Build status suffix for local models
+			let statusSuffix = "";
+			if (isLocal && localInfo) {
+				if (localInfo.isCached) {
+					statusSuffix = theme.fg("success", " ✓");
+				} else {
+					const size = localInfo.fileSizeMb ? `${(localInfo.fileSizeMb / 1024).toFixed(1)} GB` : "";
+					statusSuffix = theme.fg("warning", ` ⬇ ${size}`);
+				}
+			} else if (isCurrent) {
+				statusSuffix = theme.fg("success", " ✓");
+			}
 
 			let line = "";
 			if (isSelected) {
 				const prefix = theme.fg("accent", "→ ");
 				const modelText = `${item.id}`;
 				const providerBadge = theme.fg("muted", `[${item.provider}]`);
-				const checkmark = isCurrent ? theme.fg("success", " ✓") : "";
-				line = `${prefix + theme.fg("accent", modelText)} ${providerBadge}${checkmark}`;
+				line = `${prefix + theme.fg("accent", modelText)} ${providerBadge}${statusSuffix}`;
 			} else {
 				const modelText = `  ${item.id}`;
 				const providerBadge = theme.fg("muted", `[${item.provider}]`);
-				const checkmark = isCurrent ? theme.fg("success", " ✓") : "";
-				line = `${modelText} ${providerBadge}${checkmark}`;
+				line = `${modelText} ${providerBadge}${statusSuffix}`;
 			}
 
 			this.listContainer.addChild(new Text(line, 0, 0));
@@ -326,9 +380,97 @@ export class ModelSelectorComponent extends Container implements Focusable {
 	}
 
 	private handleSelect(model: Model<any>): void {
-		// Save as new default
+		const selectedItem = this.filteredModels[this.selectedIndex];
+		const isLocal = model.provider === FOUNDRY_LOCAL_PROVIDER;
+		const localInfo = selectedItem?.localInfo;
+
+		// For uncached Foundry Local models, download and load first
+		if (isLocal && localInfo && !localInfo.isCached) {
+			if (this.downloading) return; // Prevent double-click
+			this.downloading = true;
+			this.setStatusText(`Downloading ${model.id}...`);
+			this.tui.requestRender();
+
+			const fl = this.modelRegistry.foundryLocal;
+
+			(async () => {
+				try {
+					// Ensure service is running
+					await fl.ensureServiceRunning();
+
+					// Download with progress
+					await fl.downloadModel(model.id, (percent: number) => {
+						this.setStatusText(`Downloading ${model.id}... ${percent.toFixed(0)}%`);
+						this.tui.requestRender();
+					});
+
+					// Load model on the service
+					this.setStatusText(`Loading ${model.id}...`);
+					this.tui.requestRender();
+					await fl.loadModel(model.id);
+
+					// Update local info cache
+					if (localInfo) localInfo.isCached = true;
+
+					// Register model in registry and select it
+					const baseUrl = fl.getBaseUrl() ?? "http://127.0.0.1:5273";
+					const piModels = fl.buildPiModels([localInfo], baseUrl);
+					if (piModels.length > 0) {
+						this.modelRegistry.setFoundryLocalModels(piModels);
+						const registeredModel = this.modelRegistry.find(FOUNDRY_LOCAL_PROVIDER, model.id);
+						if (registeredModel) {
+							this.settingsManager.setDefaultModelAndProvider(registeredModel.provider, registeredModel.id);
+							this.onSelectCallback(registeredModel);
+						}
+					}
+				} catch (error) {
+					this.setStatusText(
+						theme.fg("error", `Failed: ${error instanceof Error ? error.message : String(error)}`),
+					);
+					this.tui.requestRender();
+				} finally {
+					this.downloading = false;
+				}
+			})();
+			return;
+		}
+
+		// For cached local models, ensure loaded on service
+		if (isLocal) {
+			const fl = this.modelRegistry.foundryLocal;
+			(async () => {
+				try {
+					const baseUrl = await fl.ensureServiceRunning();
+					this.setStatusText(`Loading ${model.id}...`);
+					this.tui.requestRender();
+					await fl.loadModel(model.id);
+
+					// Update model baseUrl to match running service
+					const updatedModel = { ...model, baseUrl: `${baseUrl}/v1` };
+					this.settingsManager.setDefaultModelAndProvider(updatedModel.provider, updatedModel.id);
+					this.onSelectCallback(updatedModel);
+				} catch (error) {
+					this.setStatusText(
+						theme.fg("error", `Failed: ${error instanceof Error ? error.message : String(error)}`),
+					);
+					this.tui.requestRender();
+				}
+			})();
+			return;
+		}
+
+		// Cloud models — immediate selection
 		this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
 		this.onSelectCallback(model);
+	}
+
+	private setStatusText(text: string): void {
+		if (!this.statusText) {
+			this.statusText = new Text(text, 0, 0);
+			this.listContainer.addChild(this.statusText);
+		} else {
+			this.statusText.setText(text);
+		}
 	}
 
 	getSearchInput(): Input {
