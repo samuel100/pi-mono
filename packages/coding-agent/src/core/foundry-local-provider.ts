@@ -58,6 +58,7 @@ export class FoundryLocalProvider {
 	private baseUrl: string | null = null;
 	private sdkAvailable: boolean | null = null;
 	private sdkManager: any = null;
+	private catalogAliases: Set<string> = new Set();
 
 	constructor(agentDir: string) {
 		this.lockfilePath = join(agentDir, "foundry-local-service.json");
@@ -144,7 +145,7 @@ export class FoundryLocalProvider {
 			// The catalog caches for 6 hours; we need fresh data each time the selector opens.
 			(manager.catalog as any).lastFetch = 0;
 			const models = await manager.catalog.getModels();
-			return models.map((m: any) => ({
+			const results = models.map((m: any) => ({
 				alias: m.alias,
 				displayName: m.alias,
 				fileSizeMb: null,
@@ -153,6 +154,9 @@ export class FoundryLocalProvider {
 				contextLength: null,
 				maxOutputTokens: null,
 			}));
+			// Cache aliases for mapping variant IDs to aliases in listLoadedModels
+			this.catalogAliases = new Set(results.map((m: LocalModelInfo) => m.alias));
+			return results;
 		} catch (error) {
 			console.error(
 				`Failed to query Foundry Local catalog: ${error instanceof Error ? error.message : String(error)}`,
@@ -203,7 +207,7 @@ export class FoundryLocalProvider {
 		}
 	}
 
-	/** List models currently loaded on the service. */
+	/** List model aliases currently loaded on the service. */
 	async listLoadedModels(): Promise<string[]> {
 		if (!this.baseUrl) return [];
 		try {
@@ -211,7 +215,28 @@ export class FoundryLocalProvider {
 				signal: AbortSignal.timeout(5_000),
 			});
 			if (!response.ok) return [];
-			return (await response.json()) as string[];
+			const variantIds = (await response.json()) as string[];
+
+			// Map variant IDs back to aliases.
+			// Variant IDs look like "qwen2.5-7b-instruct-generic-gpu:4",
+			// aliases look like "qwen2.5-7b". Match by prefix.
+			const loadedAliases: string[] = [];
+			for (const variantId of variantIds) {
+				let matched = false;
+				// Sort aliases longest-first so "qwen2.5-coder-7b" matches before "qwen2.5"
+				const sortedAliases = [...this.catalogAliases].sort((a, b) => b.length - a.length);
+				for (const alias of sortedAliases) {
+					if (variantId.startsWith(alias)) {
+						loadedAliases.push(alias);
+						matched = true;
+						break;
+					}
+				}
+				if (!matched) {
+					loadedAliases.push(variantId);
+				}
+			}
+			return loadedAliases;
 		} catch {
 			return [];
 		}
