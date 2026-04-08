@@ -13,11 +13,13 @@
 
 import { fork } from "node:child_process";
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
+import { createRequire } from "node:module";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Model, OpenAICompletionsCompat } from "@mariozechner/pi-ai";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
+const cjsRequire = createRequire(import.meta.url);
 
 export const FOUNDRY_LOCAL_PROVIDER = "foundry-local" as const;
 
@@ -55,6 +57,7 @@ export class FoundryLocalProvider {
 	private lockfilePath: string;
 	private baseUrl: string | null = null;
 	private sdkAvailable: boolean | null = null;
+	private sdkManager: any = null;
 
 	constructor(agentDir: string) {
 		this.lockfilePath = join(agentDir, "foundry-local-service.json");
@@ -66,9 +69,6 @@ export class FoundryLocalProvider {
 	isAvailable(): boolean {
 		if (this.sdkAvailable !== null) return this.sdkAvailable;
 		try {
-			// Check if the native core library exists for this platform
-			const { createRequire } = require("node:module");
-			const cjsRequire = createRequire(import.meta.url);
 			cjsRequire.resolve("foundry-local-sdk");
 			this.sdkAvailable = true;
 		} catch {
@@ -109,6 +109,28 @@ export class FoundryLocalProvider {
 	// ── Catalog + Download (SDK-based, runs in Pi CLI process) ───────────
 
 	/**
+	 * Get or create the FoundryLocalManager singleton for catalog/download operations.
+	 * Suppresses the native core's init log that would corrupt the TUI.
+	 */
+	private async getOrCreateManager(): Promise<any> {
+		if (this.sdkManager) return this.sdkManager;
+		const { FoundryLocalManager } = await import("foundry-local-sdk");
+
+		// Suppress native core's "Service configuration complete." log
+		const origWrite = process.stdout.write;
+		process.stdout.write = (() => true) as any;
+		try {
+			this.sdkManager = FoundryLocalManager.create({
+				appName: "pi-foundry-local",
+				logLevel: "fatal",
+			});
+		} finally {
+			process.stdout.write = origWrite;
+		}
+		return this.sdkManager;
+	}
+
+	/**
 	 * Query the full Foundry Local catalog for all available models
 	 * (including those not yet cached/downloaded).
 	 * Uses the SDK directly — /v1/models only returns cached models.
@@ -117,20 +139,16 @@ export class FoundryLocalProvider {
 		if (!this.isAvailable()) return [];
 
 		try {
-			const { FoundryLocalManager } = await import("foundry-local-sdk");
-			const manager = FoundryLocalManager.create({
-				appName: "pi-foundry-local",
-				logLevel: "warn",
-			});
+			const manager = await this.getOrCreateManager();
 			const models = await manager.catalog.getModels();
-			return models.map((m) => ({
+			return models.map((m: any) => ({
 				alias: m.alias,
-				displayName: m.info.displayName ?? m.alias,
-				fileSizeMb: m.info.fileSizeMb ?? null,
+				displayName: m.alias,
+				fileSizeMb: null,
 				isCached: m.isCached,
-				supportsToolCalling: m.supportsToolCalling ?? false,
-				contextLength: m.contextLength ?? null,
-				maxOutputTokens: m.info.maxOutputTokens ?? null,
+				supportsToolCalling: false,
+				contextLength: null,
+				maxOutputTokens: null,
 			}));
 		} catch (error) {
 			console.error(
@@ -145,11 +163,7 @@ export class FoundryLocalProvider {
 	 * Uses the SDK directly for download with progress tracking.
 	 */
 	async downloadModel(alias: string, onProgress?: (percent: number) => void): Promise<void> {
-		const { FoundryLocalManager } = await import("foundry-local-sdk");
-		const manager = FoundryLocalManager.create({
-			appName: "pi-foundry-local",
-			logLevel: "warn",
-		});
+		const manager = await this.getOrCreateManager();
 		const model = await manager.catalog.getModel(alias);
 		if (!model.isCached) {
 			await model.download(onProgress);
