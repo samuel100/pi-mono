@@ -7,5 +7,5 @@ export {
 	FOUNDRY_LOCAL_PROVIDER,
 	FoundryLocalManager,
 	type LocalModelInfo,
-} from "./manager.js";
+} from "./foundry-local.js";
 export type { LocalModelDescriptor, LocalProviderLifecycle } from "./types.js";
