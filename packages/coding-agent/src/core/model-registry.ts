@@ -536,7 +536,7 @@ export class ModelRegistry {
 		// Add new ones
 		this.models.push(...models);
 		// Set a sentinel apiKey so the provider passes auth checks
-		this.providerRequestConfigs.set(FOUNDRY_LOCAL_PROVIDER, { apiKey: "foundry-local" });
+		this.providerRequestConfigs.set(FOUNDRY_LOCAL_PROVIDER, { apiKey: "local" });
 	}
 
 	/**
@@ -604,7 +604,7 @@ export class ModelRegistry {
 	async getApiKeyAndHeaders(model: Model<Api>): Promise<ResolvedRequestAuth> {
 		// Foundry Local models don't need auth — return a sentinel key
 		if (model.provider === FOUNDRY_LOCAL_PROVIDER) {
-			return { ok: true, apiKey: "foundry-local", headers: undefined };
+			return { ok: true, apiKey: "local", headers: undefined };
 		}
 		try {
 			const providerConfig = this.providerRequestConfigs.get(model.provider);

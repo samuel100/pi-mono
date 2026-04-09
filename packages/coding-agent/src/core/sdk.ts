@@ -177,6 +177,22 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const authStorage = options.authStorage ?? AuthStorage.create(authPath);
 	const modelRegistry = options.modelRegistry ?? ModelRegistry.create(authStorage, modelsPath);
 
+	// Register Foundry Local models early so they're available at startup
+	// (before findInitialModel checks for available models)
+	const fl = modelRegistry.foundryLocal;
+	if (fl.isAvailable()) {
+		try {
+			const catalogModels = await fl.getCatalogModels();
+			if (catalogModels.length > 0) {
+				const baseUrl = await fl.ensureWebService();
+				const piModels = fl.buildPiModels(catalogModels, baseUrl);
+				modelRegistry.setFoundryLocalModels(piModels);
+			}
+		} catch {
+			// Foundry Local unavailable — continue with cloud models only
+		}
+	}
+
 	const settingsManager = options.settingsManager ?? SettingsManager.create(cwd, agentDir);
 	const sessionManager = options.sessionManager ?? SessionManager.create(cwd, getDefaultSessionDir(cwd, agentDir));
 
@@ -299,12 +315,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		streamFn: async (model, context, options) => {
 			// For Foundry Local models, ensure web service is running and model is loaded,
 			// then use Pi's standard openai-completions streaming via HTTP
-			if (model.provider === "foundry-local") {
+			if (model.provider === "local") {
 				const fl = modelRegistry.foundryLocal;
 				const baseUrl = await fl.ensureWebService();
 				await fl.loadModel(model.id);
 				model = { ...model, baseUrl: `${baseUrl}/v1` };
-				return streamSimple(model, context, { ...options, apiKey: "foundry-local" });
+				return streamSimple(model, context, { ...options, apiKey: "local" });
 			}
 			const auth = await modelRegistry.getApiKeyAndHeaders(model);
 			if (!auth.ok) {

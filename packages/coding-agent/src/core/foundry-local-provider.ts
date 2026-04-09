@@ -15,7 +15,7 @@ import type { Model, OpenAICompletionsCompat } from "@mariozechner/pi-ai";
 
 const cjsRequire = createRequire(import.meta.url);
 
-export const FOUNDRY_LOCAL_PROVIDER = "foundry-local" as const;
+export const FOUNDRY_LOCAL_PROVIDER = "local" as const;
 
 const FOUNDRY_LOCAL_COMPAT: OpenAICompletionsCompat = {
 	supportsDeveloperRole: false,
@@ -253,7 +253,7 @@ export class FoundryLocalProvider {
 	buildPiModels(catalogModels: LocalModelInfo[], baseUrl: string): Model<"openai-completions">[] {
 		return catalogModels.map((m) => ({
 			id: m.alias,
-			name: `${m.displayName} (Foundry Local)`,
+			name: m.displayName,
 			api: "openai-completions" as const,
 			provider: FOUNDRY_LOCAL_PROVIDER,
 			baseUrl: `${baseUrl}/v1`,
