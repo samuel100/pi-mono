@@ -145,6 +145,27 @@ export class FoundryLocalProvider {
 		}
 	}
 
+	/**
+	 * Unload all loaded models and clean up resources.
+	 * Call on Pi shutdown to prevent OGA memory leaks.
+	 */
+	async cleanup(): Promise<void> {
+		if (!this.sdkManager) return;
+		try {
+			const loadedModels = await this.sdkManager.catalog.getLoadedModels();
+			for (const model of loadedModels) {
+				try {
+					await model.unload();
+				} catch {
+					// Best-effort cleanup
+				}
+			}
+		} catch {
+			// Ignore errors during cleanup
+		}
+		this.loadedChatClients.clear();
+	}
+
 	// ── Streaming inference (native FFI) ─────────────────────────────────
 
 	streamChat(model: Model<any>, context: Context, _options?: SimpleStreamOptions): AssistantMessageEventStream {

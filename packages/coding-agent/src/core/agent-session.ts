@@ -717,6 +717,8 @@ export class AgentSession {
 	dispose(): void {
 		this._disconnectFromAgent();
 		this._eventListeners = [];
+		// Unload Foundry Local models to prevent OGA memory leaks
+		this._modelRegistry.foundryLocal.cleanup().catch(() => {});
 	}
 
 	// =========================================================================
