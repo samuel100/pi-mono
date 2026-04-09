@@ -227,7 +227,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		}
 		if (!model) {
 			if (foundryLocalAvailable) {
-				modelFallbackMessage = "Local models are available to download. Use /model to select one.";
+				modelFallbackMessage = `Local models are available to use. Use /model to select one. For cloud models, use /login or set an API key environment variable. See ${join(getDocsPath(), "providers.md")}`;
 			} else {
 				modelFallbackMessage = `No models available. Use /login or set an API key environment variable. See ${join(getDocsPath(), "providers.md")}. Then use /model to select a model.`;
 			}
