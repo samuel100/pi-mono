@@ -141,15 +141,21 @@ export class FoundryLocalProvider {
 			const manager = await this.getOrCreateManager();
 			(manager.catalog as any).lastFetch = 0;
 			const models = await manager.catalog.getModels();
-			const results = models.map((m: any) => ({
-				alias: m.alias,
-				displayName: m.alias,
-				fileSizeMb: null,
-				isCached: m.isCached,
-				supportsToolCalling: false,
-				contextLength: null,
-				maxOutputTokens: null,
-			}));
+			const results = models
+				.map((m: any) => {
+					const info = m._variants?.[0]?._modelInfo;
+					return {
+						alias: m.alias,
+						displayName: m.alias,
+						fileSizeMb: info?.fileSizeMb ?? null,
+						isCached: m.isCached,
+						supportsToolCalling: info?.supportsToolCalling ?? false,
+						contextLength: null,
+						maxOutputTokens: info?.maxOutputTokens ?? null,
+					};
+				})
+				// Only show models that support tool calling (required for Pi's agentic workflows)
+				.filter((m: LocalModelInfo) => m.supportsToolCalling);
 			this.catalogAliases = new Set(results.map((m: LocalModelInfo) => m.alias));
 			return results;
 		} catch (error) {
