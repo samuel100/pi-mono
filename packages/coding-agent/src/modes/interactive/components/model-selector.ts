@@ -229,17 +229,22 @@ export class ModelSelectorComponent extends Container implements Focusable {
 
 	private sortModels(models: ModelItem[]): ModelItem[] {
 		const sorted = [...models];
-		// Sort priority: current model > loaded local > cached local > cloud models > uncached local
+		// Sort priority: current model (if cached/loaded) > loaded local > cached local > cloud models > uncached local
 		sorted.sort((a, b) => {
 			const aIsCurrent = modelsAreEqual(this.currentModel, a.model);
 			const bIsCurrent = modelsAreEqual(this.currentModel, b.model);
-			if (aIsCurrent && !bIsCurrent) return -1;
-			if (!aIsCurrent && bIsCurrent) return 1;
-
 			const aIsLocal = a.provider === FOUNDRY_LOCAL_PROVIDER;
 			const bIsLocal = b.provider === FOUNDRY_LOCAL_PROVIDER;
 
-			// Local models with cache state sort above uncached local models
+			// Current model first, but only if it's cached/loaded (not uncached download-needed)
+			const aCurrentAndReady =
+				aIsCurrent && (!aIsLocal || a.localInfo?.isCached || this.loadedLocalModels.has(a.id));
+			const bCurrentAndReady =
+				bIsCurrent && (!bIsLocal || b.localInfo?.isCached || this.loadedLocalModels.has(b.id));
+			if (aCurrentAndReady && !bCurrentAndReady) return -1;
+			if (!aCurrentAndReady && bCurrentAndReady) return 1;
+
+			// Among local models: loaded > cached > uncached
 			if (aIsLocal && bIsLocal) {
 				const aLoaded = this.loadedLocalModels.has(a.id);
 				const bLoaded = this.loadedLocalModels.has(b.id);
@@ -254,7 +259,7 @@ export class ModelSelectorComponent extends Container implements Focusable {
 				return a.id.localeCompare(b.id);
 			}
 
-			// Cached local models sort above cloud models; uncached sort below
+			// Cached/loaded local models sort above cloud models; uncached sort below
 			if (aIsLocal && !bIsLocal) {
 				return a.localInfo?.isCached || this.loadedLocalModels.has(a.id) ? -1 : 1;
 			}
