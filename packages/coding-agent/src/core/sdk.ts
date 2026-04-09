@@ -1,7 +1,7 @@
 import { join } from "node:path";
 import { Agent, type AgentMessage, type ThinkingLevel } from "@mariozechner/pi-agent-core";
 import { type Message, type Model, streamSimple } from "@mariozechner/pi-ai";
-import { FOUNDRY_LOCAL_PROVIDER } from "@mariozechner/pi-local";
+import { createFoundryLocalProvider } from "@mariozechner/pi-local";
 import { getAgentDir, getDocsPath } from "../config.js";
 import { AgentSession } from "./agent-session.js";
 import { AuthStorage } from "./auth-storage.js";
@@ -178,8 +178,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const authStorage = options.authStorage ?? AuthStorage.create(authPath);
 	const modelRegistry = options.modelRegistry ?? ModelRegistry.create(authStorage, modelsPath);
 
-	// Check if Foundry Local SDK is available on this platform
-	const localAvailable = modelRegistry.foundryLocal.isAvailable();
+	// Register Foundry Local as a lifecycle provider (if SDK is available)
+	const flProvider = createFoundryLocalProvider();
+	if (flProvider.isAvailable()) {
+		modelRegistry.registerProvider(flProvider.providerName, { noAuth: true, lifecycle: flProvider });
+	}
+	const localAvailable = modelRegistry.hasAnyLocalProvider();
 
 	const settingsManager = options.settingsManager ?? SettingsManager.create(cwd, agentDir);
 	const sessionManager = options.sessionManager ?? SessionManager.create(cwd, getDefaultSessionDir(cwd, agentDir));
@@ -303,10 +307,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		},
 		convertToLlm: convertToLlmWithBlockImages,
 		streamFn: async (model, context, options) => {
-			// Local models: ensure web service is running and model is loaded
-			if (model.provider === FOUNDRY_LOCAL_PROVIDER) {
-				const baseUrl = await modelRegistry.foundryLocal.prepareModel(model.id);
-				model = { ...model, baseUrl: `${baseUrl}/v1` };
+			// Lifecycle providers (local runtimes): prepare model before streaming
+			const prepResult = await modelRegistry.prepareLifecycleModel(model.provider, model.id);
+			if (prepResult?.baseUrl) {
+				model = { ...model, baseUrl: prepResult.baseUrl };
 			}
 			const auth = await modelRegistry.getApiKeyAndHeaders(model);
 			if (!auth.ok) {

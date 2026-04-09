@@ -34,6 +34,46 @@ export interface LocalModelInfo {
 	maxOutputTokens: number | null;
 }
 
+// ── Generic local provider lifecycle types ───────────────────────────
+
+/**
+ * Neutral model descriptor — no dependency on pi-ai's Model type.
+ * Any local provider (Foundry Local, Ollama, LM Studio) returns these.
+ */
+export interface LocalModelDescriptor {
+	id: string;
+	name: string;
+	status: "loaded" | "cached" | "available";
+	downloadSize?: string;
+	contextLength: number;
+	maxOutputTokens: number;
+	compat?: Record<string, boolean | string>;
+}
+
+/**
+ * Lifecycle interface for any local model provider.
+ * Implement this to plug a new local runtime into Pi's coding-agent.
+ */
+export interface LocalProviderLifecycle {
+	/** Provider name for registration (e.g., "local", "ollama"). */
+	readonly providerName: string;
+
+	/** Check if runtime is available on this platform. */
+	isAvailable(): boolean;
+
+	/** Discover models with status metadata. May be slow (~18s for catalog providers). */
+	discoverModels(): Promise<LocalModelDescriptor[]>;
+
+	/** Download a model. Called when user selects an 'available' model. */
+	downloadModel(modelId: string, onProgress: (percent: number) => void): Promise<void>;
+
+	/** Prepare model for streaming. Returns the baseUrl to use for inference. */
+	prepareForStreaming(modelId: string): Promise<{ baseUrl: string }>;
+
+	/** Clean up resources (web service, loaded models). */
+	dispose(): Promise<void>;
+}
+
 export class FoundryLocalManager {
 	private sdkAvailable: boolean | null = null;
 	private sdkManager: any = null;
@@ -328,4 +368,53 @@ export class FoundryLocalManager {
 			compat: FOUNDRY_LOCAL_COMPAT,
 		}));
 	}
+}
+
+// ── Factory: create a Foundry Local lifecycle provider ───────────────
+
+/**
+ * Create a LocalProviderLifecycle backed by the Foundry Local SDK.
+ * The returned object can be passed to `registerProvider()` as a lifecycle.
+ */
+export function createFoundryLocalProvider(): LocalProviderLifecycle {
+	const manager = new FoundryLocalManager();
+
+	return {
+		providerName: FOUNDRY_LOCAL_PROVIDER,
+
+		isAvailable: () => manager.isAvailable(),
+
+		discoverModels: async (): Promise<LocalModelDescriptor[]> => {
+			const catalog = await manager.getCatalogModels();
+			const loadedModels = await manager.listLoadedModels();
+			const loadedSet = new Set(loadedModels);
+
+			// Only include models that support tool calling (Pi needs tool use)
+			const toolCapable = catalog.filter((c) => c.supportsToolCalling);
+
+			return toolCapable.map((info) => ({
+				id: info.alias,
+				name: info.displayName,
+				status: loadedSet.has(info.alias)
+					? ("loaded" as const)
+					: info.isCached
+						? ("cached" as const)
+						: ("available" as const),
+				downloadSize: info.fileSizeMb ? `${(info.fileSizeMb / 1024).toFixed(1)} GB` : undefined,
+				contextLength: info.contextLength ?? 32768,
+				maxOutputTokens: info.maxOutputTokens ?? 4096,
+				compat: FOUNDRY_LOCAL_COMPAT as unknown as Record<string, boolean | string>,
+			}));
+		},
+
+		downloadModel: (modelId: string, onProgress: (percent: number) => void) =>
+			manager.downloadModel(modelId, onProgress),
+
+		prepareForStreaming: async (modelId: string) => {
+			const baseUrl = await manager.prepareModel(modelId);
+			return { baseUrl: `${baseUrl}/v1` };
+		},
+
+		dispose: () => manager.cleanup(),
+	};
 }

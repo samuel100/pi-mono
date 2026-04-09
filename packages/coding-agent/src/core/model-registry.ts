@@ -18,7 +18,7 @@ import {
 	type SimpleStreamOptions,
 } from "@mariozechner/pi-ai";
 import { registerOAuthProvider, resetOAuthProviders } from "@mariozechner/pi-ai/oauth";
-import { FOUNDRY_LOCAL_PROVIDER, FoundryLocalManager } from "@mariozechner/pi-local";
+import type { LocalModelDescriptor, LocalProviderLifecycle } from "@mariozechner/pi-local";
 import { type Static, Type } from "@sinclair/typebox";
 import AjvModule from "ajv";
 import { existsSync, readFileSync } from "fs";
@@ -250,6 +250,12 @@ function applyModelOverride(model: Model<Api>, override: ModelOverride): Model<A
 /** Clear the config value command cache. Exported for testing. */
 export const clearApiKeyCache = clearConfigValueCache;
 
+/** Status metadata for a model from a lifecycle provider. */
+export interface ModelLifecycleInfo {
+	status: "loaded" | "cached" | "available";
+	downloadSize?: string;
+}
+
 /**
  * Model registry - loads and manages models, resolves API keys via AuthStorage.
  */
@@ -259,15 +265,11 @@ export class ModelRegistry {
 	private modelRequestHeaders: Map<string, Record<string, string>> = new Map();
 	private registeredProviders: Map<string, ProviderConfigInput> = new Map();
 	private loadError: string | undefined = undefined;
-	private _foundryLocal?: FoundryLocalManager;
 
-	/** Lazy-initialized Foundry Local manager for local model support. */
-	get foundryLocal(): FoundryLocalManager {
-		if (!this._foundryLocal) {
-			this._foundryLocal = new FoundryLocalManager();
-		}
-		return this._foundryLocal;
-	}
+	// ── Lifecycle provider infrastructure ──────────────────────────────
+	private lifecycleProviders: Map<string, LocalProviderLifecycle> = new Map();
+	private lifecycleModelInfo: Map<string, ModelLifecycleInfo> = new Map();
+	private discoveryDone: Set<string> = new Set();
 
 	private constructor(
 		readonly authStorage: AuthStorage,
@@ -291,6 +293,8 @@ export class ModelRegistry {
 		this.providerRequestConfigs.clear();
 		this.modelRequestHeaders.clear();
 		this.loadError = undefined;
+		this.discoveryDone.clear();
+		this.lifecycleModelInfo.clear();
 
 		// Ensure dynamic API/OAuth registrations are rebuilt from current provider state.
 		resetApiProviders();
@@ -545,7 +549,7 @@ export class ModelRegistry {
 	 * Get API key for a model.
 	 */
 	hasConfiguredAuth(model: Model<Api>): boolean {
-		if (model.provider === FOUNDRY_LOCAL_PROVIDER) return true;
+		if (this.registeredProviders.get(model.provider)?.noAuth) return true;
 		return (
 			this.authStorage.hasAuth(model.provider) ||
 			this.providerRequestConfigs.get(model.provider)?.apiKey !== undefined
@@ -588,7 +592,7 @@ export class ModelRegistry {
 	 * Get API key and request headers for a model.
 	 */
 	async getApiKeyAndHeaders(model: Model<Api>): Promise<ResolvedRequestAuth> {
-		if (model.provider === FOUNDRY_LOCAL_PROVIDER) {
+		if (this.registeredProviders.get(model.provider)?.noAuth) {
 			return { ok: true, apiKey: "local" };
 		}
 		try {
@@ -677,10 +681,17 @@ export class ModelRegistry {
 	unregisterProvider(providerName: string): void {
 		if (!this.registeredProviders.has(providerName)) return;
 		this.registeredProviders.delete(providerName);
+		this.lifecycleProviders.delete(providerName);
+		this.discoveryDone.delete(providerName);
 		this.refresh();
 	}
 
 	private validateProviderConfig(providerName: string, config: ProviderConfigInput): void {
+		// Lifecycle providers manage their own models dynamically — skip static checks
+		if (config.lifecycle) {
+			return;
+		}
+
 		if (config.streamSimple && !config.api) {
 			throw new Error(`Provider ${providerName}: "api" is required when registering streamSimple.`);
 		}
@@ -692,7 +703,7 @@ export class ModelRegistry {
 		if (!config.baseUrl) {
 			throw new Error(`Provider ${providerName}: "baseUrl" is required when defining models.`);
 		}
-		if (!config.apiKey && !config.oauth) {
+		if (!config.apiKey && !config.oauth && !config.noAuth) {
 			throw new Error(`Provider ${providerName}: "apiKey" or "oauth" is required when defining models.`);
 		}
 
@@ -705,6 +716,11 @@ export class ModelRegistry {
 	}
 
 	private applyProviderConfig(providerName: string, config: ProviderConfigInput): void {
+		// Store lifecycle provider if present
+		if (config.lifecycle) {
+			this.lifecycleProviders.set(providerName, config.lifecycle);
+		}
+
 		// Register OAuth provider if provided
 		if (config.oauth) {
 			// Ensure the OAuth provider ID matches the provider name
@@ -773,11 +789,97 @@ export class ModelRegistry {
 		}
 	}
 
+	// ── Lifecycle provider facade ────────────────────────────────────────
+
+	/** True if any registered lifecycle provider is available. */
+	hasAnyLocalProvider(): boolean {
+		for (const lifecycle of this.lifecycleProviders.values()) {
+			if (lifecycle.isAvailable()) return true;
+		}
+		return false;
+	}
+
+	/** Get lifecycle info (status, downloadSize) for a specific model. */
+	getModelLifecycleInfo(provider: string, modelId: string): ModelLifecycleInfo | undefined {
+		return this.lifecycleModelInfo.get(`${provider}:${modelId}`);
+	}
+
 	/**
-	 * Replace local models in the registry with the given set.
+	 * Ensure lifecycle providers have discovered their models.
+	 * Lazy — only runs once per provider until refresh() clears state.
+	 * Materializes Model objects in the registry from neutral descriptors.
 	 */
-	setFoundryLocalModels(localModels: Model<Api>[]) {
-		this.models = [...this.models.filter((m) => m.provider !== FOUNDRY_LOCAL_PROVIDER), ...localModels];
+	async ensureLifecycleModelsDiscovered(): Promise<void> {
+		for (const [providerName, lifecycle] of this.lifecycleProviders) {
+			if (this.discoveryDone.has(providerName)) continue;
+			this.discoveryDone.add(providerName);
+
+			try {
+				const descriptors = await lifecycle.discoverModels();
+
+				// Build Model<Api> objects from neutral descriptors
+				const newModels: Model<Api>[] = [];
+				for (const d of descriptors) {
+					newModels.push(this.buildModelFromDescriptor(providerName, d));
+					this.lifecycleModelInfo.set(`${providerName}:${d.id}`, {
+						status: d.status,
+						downloadSize: d.downloadSize,
+					});
+				}
+
+				// Replace all models for this provider
+				this.models = [...this.models.filter((m) => m.provider !== providerName), ...newModels];
+			} catch {
+				// Discovery failed — continue with whatever models exist
+			}
+		}
+	}
+
+	/** Download a model via its lifecycle provider. */
+	async downloadLifecycleModel(
+		provider: string,
+		modelId: string,
+		onProgress: (percent: number) => void,
+	): Promise<void> {
+		const lifecycle = this.lifecycleProviders.get(provider);
+		if (!lifecycle) throw new Error(`No lifecycle provider for "${provider}"`);
+		await lifecycle.downloadModel(modelId, onProgress);
+
+		// Mark as cached after successful download
+		const key = `${provider}:${modelId}`;
+		const existing = this.lifecycleModelInfo.get(key);
+		if (existing) {
+			this.lifecycleModelInfo.set(key, { ...existing, status: "cached" });
+		}
+	}
+
+	/** Prepare a lifecycle model for streaming. Returns baseUrl override if applicable. */
+	async prepareLifecycleModel(provider: string, modelId: string): Promise<{ baseUrl: string } | undefined> {
+		const lifecycle = this.lifecycleProviders.get(provider);
+		if (!lifecycle) return undefined;
+		return lifecycle.prepareForStreaming(modelId);
+	}
+
+	/** Dispose all lifecycle providers. Uses allSettled so one failure doesn't block others. */
+	async disposeLifecycleProviders(): Promise<void> {
+		await Promise.allSettled([...this.lifecycleProviders.values()].map((lc) => lc.dispose()));
+	}
+
+	/** Build a Model<Api> from a neutral LocalModelDescriptor. */
+	private buildModelFromDescriptor(providerName: string, d: LocalModelDescriptor): Model<Api> {
+		return {
+			id: d.id,
+			name: d.name,
+			api: "openai-completions" as const,
+			provider: providerName,
+			baseUrl: "http://localhost:0/v1", // placeholder — prepareForStreaming provides the real URL
+			reasoning: false,
+			input: ["text" as const],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: d.contextLength,
+			maxTokens: d.maxOutputTokens,
+			compat: d.compat as Model<"openai-completions">["compat"],
+		} as Model<Api>;
 	}
 }
 
@@ -806,4 +908,8 @@ export interface ProviderConfigInput {
 		headers?: Record<string, string>;
 		compat?: Model<Api>["compat"];
 	}>;
+	/** If true, skip API key requirement. Returns synthetic "local" apiKey. */
+	noAuth?: boolean;
+	/** Lifecycle hooks for local model runtimes (e.g., Foundry Local, Ollama). */
+	lifecycle?: LocalProviderLifecycle;
 }

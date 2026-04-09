@@ -1,5 +1,4 @@
 import { type Model, modelsAreEqual } from "@mariozechner/pi-ai";
-import { FOUNDRY_LOCAL_PROVIDER, type LocalModelInfo } from "@mariozechner/pi-local";
 import {
 	Container,
 	type Focusable,
@@ -10,7 +9,7 @@ import {
 	Text,
 	type TUI,
 } from "@mariozechner/pi-tui";
-import type { ModelRegistry } from "../../../core/model-registry.js";
+import type { ModelLifecycleInfo, ModelRegistry } from "../../../core/model-registry.js";
 import type { SettingsManager } from "../../../core/settings-manager.js";
 import { theme } from "../theme/theme.js";
 import { DynamicBorder } from "./dynamic-border.js";
@@ -20,8 +19,8 @@ interface ModelItem {
 	provider: string;
 	id: string;
 	model: Model<any>;
-	/** Catalog info for local models (download size, cached state). */
-	localInfo?: LocalModelInfo;
+	/** Status info from lifecycle providers (loaded/cached/available, download size). */
+	lifecycleInfo?: ModelLifecycleInfo;
 }
 
 interface ScopedModelItem {
@@ -149,13 +148,17 @@ export class ModelSelectorComponent extends Container implements Focusable {
 			this.errorMessage = loadError;
 		}
 
-		// Load available models (built-in models still work even if models.json failed)
+		// Discover lifecycle provider models (Foundry Local, Ollama, etc.)
+		await this.modelRegistry.ensureLifecycleModelsDiscovered();
+
+		// Load available models (built-in + lifecycle-discovered + models.json)
 		try {
 			const availableModels = await this.modelRegistry.getAvailable();
 			models = availableModels.map((model: Model<any>) => ({
 				provider: model.provider,
 				id: model.id,
 				model,
+				lifecycleInfo: this.modelRegistry.getModelLifecycleInfo(model.provider, model.id),
 			}));
 		} catch (error) {
 			this.allModels = [];
@@ -164,59 +167,6 @@ export class ModelSelectorComponent extends Container implements Focusable {
 			this.filteredModels = [];
 			this.errorMessage = error instanceof Error ? error.message : String(error);
 			return;
-		}
-
-		// Fetch Foundry Local catalog and merge local models
-		const fl = this.modelRegistry.foundryLocal;
-		if (fl.isAvailable()) {
-			try {
-				const catalog = await fl.getCatalogModels();
-				const loadedModels = await fl.listLoadedModels();
-				const loadedSet = new Set(loadedModels);
-
-				// Filter to tool-calling models only (Pi needs tool use)
-				const toolCapable = catalog.filter((c) => c.supportsToolCalling);
-
-				// Build Pi model objects for all catalog models
-				const baseUrl = fl.getBaseUrl() ?? "http://localhost:5273";
-				const existingLocalIds = new Set(
-					models.filter((m) => m.provider === FOUNDRY_LOCAL_PROVIDER).map((m) => m.id),
-				);
-
-				for (const info of toolCapable) {
-					if (existingLocalIds.has(info.alias)) {
-						// Attach localInfo to already-registered model
-						const existing = models.find((m) => m.provider === FOUNDRY_LOCAL_PROVIDER && m.id === info.alias);
-						if (existing) {
-							existing.localInfo = info;
-						}
-					} else {
-						// Add new catalog model to list
-						const piModels = fl.buildPiModels([info], baseUrl);
-						if (piModels[0]) {
-							models.push({
-								provider: FOUNDRY_LOCAL_PROVIDER,
-								id: info.alias,
-								model: piModels[0],
-								localInfo: info,
-							});
-						}
-					}
-				}
-
-				// Mark loaded state
-				for (const item of models) {
-					if (item.provider === FOUNDRY_LOCAL_PROVIDER && item.localInfo) {
-						(item.localInfo as any)._isLoaded = loadedSet.has(item.id);
-					}
-				}
-
-				// Register all local models in the registry so they're usable
-				const localPiModels = models.filter((m) => m.provider === FOUNDRY_LOCAL_PROVIDER).map((m) => m.model);
-				this.modelRegistry.setFoundryLocalModels(localPiModels);
-			} catch {
-				// Catalog fetch failed — continue with cloud models only
-			}
 		}
 
 		this.allModels = this.sortModels(models);
@@ -247,10 +197,10 @@ export class ModelSelectorComponent extends Container implements Focusable {
 
 			// Sort order: loaded local > cached local > cloud > uncached local
 			const rank = (item: ModelItem): number => {
-				if (item.provider !== FOUNDRY_LOCAL_PROVIDER) return 2; // cloud
-				if ((item.localInfo as any)?._isLoaded) return 0; // loaded
-				if (item.localInfo?.isCached) return 1; // cached
-				return 3; // uncached (needs download)
+				if (!item.lifecycleInfo) return 2; // cloud (no lifecycle = standard provider)
+				if (item.lifecycleInfo.status === "loaded") return 0;
+				if (item.lifecycleInfo.status === "cached") return 1;
+				return 3; // available (needs download)
 			};
 			const ra = rank(a);
 			const rb = rank(b);
@@ -312,16 +262,15 @@ export class ModelSelectorComponent extends Container implements Focusable {
 			const isSelected = i === this.selectedIndex;
 			const isCurrent = modelsAreEqual(this.currentModel, item.model);
 
-			// Build status suffix for local models
+			// Build status suffix for lifecycle-managed models
 			let statusSuffix = "";
-			if (item.provider === FOUNDRY_LOCAL_PROVIDER && item.localInfo) {
-				if ((item.localInfo as any)._isLoaded) {
+			if (item.lifecycleInfo) {
+				if (item.lifecycleInfo.status === "loaded") {
 					statusSuffix = theme.fg("success", " ✓ loaded");
-				} else if (item.localInfo.isCached) {
+				} else if (item.lifecycleInfo.status === "cached") {
 					statusSuffix = theme.fg("muted", " (cached)");
 				} else {
-					const sizeMb = item.localInfo.fileSizeMb;
-					const sizeStr = sizeMb ? `${(sizeMb / 1024).toFixed(1)} GB` : "";
+					const sizeStr = item.lifecycleInfo.downloadSize ?? "";
 					statusSuffix = theme.fg("muted", ` ⬇ ${sizeStr}`);
 				}
 			}
@@ -409,17 +358,17 @@ export class ModelSelectorComponent extends Container implements Focusable {
 
 	private handleSelect(model: Model<any>): void {
 		const selectedItem = this.filteredModels[this.selectedIndex];
-		const info = selectedItem?.localInfo;
+		const info = selectedItem?.lifecycleInfo;
 
-		// If this is an uncached local model, download it first
-		if (selectedItem?.provider === FOUNDRY_LOCAL_PROVIDER && info && !info.isCached) {
-			this.downloadAndSelect(selectedItem, model);
+		// If this is an uncached lifecycle model, download it first
+		if (info?.status === "available") {
+			this.downloadAndSelect(selectedItem!, model);
 			return;
 		}
 
-		// For cached local models, eagerly start web service + load model
-		if (model.provider === FOUNDRY_LOCAL_PROVIDER) {
-			this.modelRegistry.foundryLocal.prepareModel(model.id).catch(() => {});
+		// For cached/loaded lifecycle models, eagerly prepare (fire-and-forget)
+		if (info) {
+			this.modelRegistry.prepareLifecycleModel(model.provider, model.id).catch(() => {});
 		}
 
 		// Save as new default
@@ -428,8 +377,6 @@ export class ModelSelectorComponent extends Container implements Focusable {
 	}
 
 	private async downloadAndSelect(item: ModelItem, model: Model<any>): Promise<void> {
-		const fl = this.modelRegistry.foundryLocal;
-
 		// Show download progress in the list
 		const progressText = new Text(theme.fg("accent", `  Downloading ${item.id}...`), 0, 0);
 		this.listContainer.clear();
@@ -437,16 +384,13 @@ export class ModelSelectorComponent extends Container implements Focusable {
 		this.tui.requestRender();
 
 		try {
-			await fl.downloadModel(item.id, (pct) => {
+			await this.modelRegistry.downloadLifecycleModel(item.provider, item.id, (pct) => {
 				progressText.setText(theme.fg("accent", `  Downloading ${item.id}... ${Math.round(pct)}%`));
 				this.tui.requestRender();
 			});
 
-			// Mark as cached, eagerly load, and select
-			if (item.localInfo) {
-				item.localInfo.isCached = true;
-			}
-			fl.prepareModel(item.id).catch(() => {});
+			// Eagerly prepare and select
+			this.modelRegistry.prepareLifecycleModel(model.provider, model.id).catch(() => {});
 			this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
 			this.onSelectCallback(model);
 		} catch (error) {
