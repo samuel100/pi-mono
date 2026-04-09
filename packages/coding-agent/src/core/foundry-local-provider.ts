@@ -143,13 +143,17 @@ export class FoundryLocalProvider {
 			const models = await manager.catalog.getModels();
 			const results = models
 				.map((m: any) => {
+					// IModel.supportsToolCalling is defined in the SDK interface but
+					// returns undefined in v0.9.0. Fall back to internal _modelInfo
+					// until the public getter is implemented in a future SDK release.
+					const stc = m.supportsToolCalling ?? m._variants?.[0]?._modelInfo?.supportsToolCalling ?? false;
 					const info = m._variants?.[0]?._modelInfo;
 					return {
 						alias: m.alias,
 						displayName: m.alias,
 						fileSizeMb: info?.fileSizeMb ?? null,
 						isCached: m.isCached,
-						supportsToolCalling: info?.supportsToolCalling ?? false,
+						supportsToolCalling: stc,
 						contextLength: null,
 						maxOutputTokens: info?.maxOutputTokens ?? null,
 					};
