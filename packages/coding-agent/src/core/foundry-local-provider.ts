@@ -64,15 +64,20 @@ export class FoundryLocalProvider {
 	private async getOrCreateManager(): Promise<any> {
 		if (this.sdkManager) return this.sdkManager;
 		const { FoundryLocalManager } = await import("foundry-local-sdk");
-		const origWrite = process.stdout.write;
+		// Suppress native core's init log that corrupts the TUI.
+		// The log goes to stdout despite logLevel: "fatal".
+		const origStdout = process.stdout.write;
+		const origStderr = process.stderr.write;
 		process.stdout.write = (() => true) as any;
+		process.stderr.write = (() => true) as any;
 		try {
 			this.sdkManager = FoundryLocalManager.create({
 				appName: "pi-foundry-local",
 				logLevel: "fatal",
 			});
 		} finally {
-			process.stdout.write = origWrite;
+			process.stdout.write = origStdout;
+			process.stderr.write = origStderr;
 		}
 		return this.sdkManager;
 	}
@@ -191,35 +196,16 @@ export class FoundryLocalProvider {
 			};
 
 			try {
-				// Emit start early so user sees immediate feedback during model loading
 				stream.push({ type: "start", partial: output });
 
-				// Show loading indicator if model needs to be loaded into memory
+				// Show loading indicator directly via stderr (synchronous) because
+				// model.load() is a blocking FFI call that prevents TUI rendering
 				const needsLoad = !this.loadedChatClients.has(model.id);
 				if (needsLoad) {
-					output.content.push({ type: "text", text: "" });
-					const loadingIdx = output.content.length - 1;
-					stream.push({ type: "text_start", contentIndex: loadingIdx, partial: output });
-					const loadingMsg = `Loading ${model.id} into memory...\n`;
-					(output.content[loadingIdx] as any).text = loadingMsg;
-					stream.push({ type: "text_delta", contentIndex: loadingIdx, delta: loadingMsg, partial: output });
-
-					// Yield event loop so TUI can render the loading message
-					// before the blocking FFI model.load() call
-					await new Promise((resolve) => setTimeout(resolve, 50));
+					process.stderr.write(`\x1b[33mLoading ${model.id} into memory...\x1b[0m\n`);
 				}
 
 				const chatClient = await this.getChatClient(model.id);
-
-				// End loading text block and reset content for actual response
-				if (needsLoad) {
-					const loadingIdx = 0;
-					const textBlock = output.content[loadingIdx];
-					if (textBlock?.type === "text") {
-						stream.push({ type: "text_end", contentIndex: loadingIdx, content: textBlock.text, partial: output });
-					}
-					output.content = [];
-				}
 
 				const messages = convertContextToOpenAI(context);
 				const tools = context.tools ? convertToolsToOpenAI(context.tools) : undefined;
