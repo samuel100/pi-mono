@@ -1,4 +1,5 @@
 import { type Model, modelsAreEqual } from "@mariozechner/pi-ai";
+import { FOUNDRY_LOCAL_PROVIDER, type LocalModelInfo } from "@mariozechner/pi-local";
 import {
 	Container,
 	type Focusable,
@@ -19,6 +20,8 @@ interface ModelItem {
 	provider: string;
 	id: string;
 	model: Model<any>;
+	/** Catalog info for local models (download size, cached state). */
+	localInfo?: LocalModelInfo;
 }
 
 interface ScopedModelItem {
@@ -163,6 +166,58 @@ export class ModelSelectorComponent extends Container implements Focusable {
 			return;
 		}
 
+		// Fetch Foundry Local catalog and merge uncached models
+		const fl = this.modelRegistry.foundryLocal;
+		if (fl.isAvailable()) {
+			try {
+				const catalog = await fl.getCatalogModels();
+				const loadedModels = await fl.listLoadedModels();
+				const loadedSet = new Set(loadedModels);
+				const existingLocalIds = new Set(
+					models.filter((m) => m.provider === FOUNDRY_LOCAL_PROVIDER).map((m) => m.id),
+				);
+
+				// Attach localInfo to existing local models
+				for (const item of models) {
+					if (item.provider === FOUNDRY_LOCAL_PROVIDER) {
+						const info = catalog.find((c) => c.alias === item.id);
+						if (info) {
+							item.localInfo = { ...info, isCached: true };
+						}
+					}
+				}
+
+				// Add uncached catalog models (not yet in registry)
+				const baseUrl = fl.getBaseUrl() ?? "http://localhost:5273";
+				for (const info of catalog) {
+					if (!existingLocalIds.has(info.alias) && !info.isCached) {
+						const piModels = fl.buildPiModels([info], baseUrl);
+						if (piModels[0]) {
+							models.push({
+								provider: FOUNDRY_LOCAL_PROVIDER,
+								id: info.alias,
+								model: piModels[0],
+								localInfo: info,
+							});
+						}
+					}
+				}
+
+				// Mark loaded state in localInfo
+				for (const item of models) {
+					if (item.provider === FOUNDRY_LOCAL_PROVIDER && item.localInfo) {
+						(item.localInfo as any)._isLoaded = loadedSet.has(item.id);
+					}
+				}
+
+				// Register all local models in the registry so they're usable
+				const localPiModels = models.filter((m) => m.provider === FOUNDRY_LOCAL_PROVIDER).map((m) => m.model);
+				this.modelRegistry.setFoundryLocalModels(localPiModels);
+			} catch {
+				// Catalog fetch failed — continue with cloud models only
+			}
+		}
+
 		this.allModels = this.sortModels(models);
 		this.scopedModels = this.scopedModels.map((scoped) => {
 			const refreshed = this.modelRegistry.find(scoped.model.provider, scoped.model.id);
@@ -182,13 +237,25 @@ export class ModelSelectorComponent extends Container implements Focusable {
 
 	private sortModels(models: ModelItem[]): ModelItem[] {
 		const sorted = [...models];
-		// Sort: current model first, then by provider
 		sorted.sort((a, b) => {
+			// Current model always first
 			const aIsCurrent = modelsAreEqual(this.currentModel, a.model);
 			const bIsCurrent = modelsAreEqual(this.currentModel, b.model);
 			if (aIsCurrent && !bIsCurrent) return -1;
 			if (!aIsCurrent && bIsCurrent) return 1;
-			return a.provider.localeCompare(b.provider);
+
+			// Sort order: loaded local > cached local > cloud > uncached local
+			const rank = (item: ModelItem): number => {
+				if (item.provider !== FOUNDRY_LOCAL_PROVIDER) return 2; // cloud
+				if ((item.localInfo as any)?._isLoaded) return 0; // loaded
+				if (item.localInfo?.isCached) return 1; // cached
+				return 3; // uncached (needs download)
+			};
+			const ra = rank(a);
+			const rb = rank(b);
+			if (ra !== rb) return ra - rb;
+
+			return a.provider.localeCompare(b.provider) || a.id.localeCompare(b.id);
 		});
 		return sorted;
 	}
@@ -244,18 +311,32 @@ export class ModelSelectorComponent extends Container implements Focusable {
 			const isSelected = i === this.selectedIndex;
 			const isCurrent = modelsAreEqual(this.currentModel, item.model);
 
+			// Build status suffix for local models
+			let statusSuffix = "";
+			if (item.provider === FOUNDRY_LOCAL_PROVIDER && item.localInfo) {
+				if ((item.localInfo as any)._isLoaded) {
+					statusSuffix = theme.fg("success", " ✓ loaded");
+				} else if (item.localInfo.isCached) {
+					statusSuffix = theme.fg("muted", " (cached)");
+				} else {
+					const sizeMb = item.localInfo.fileSizeMb;
+					const sizeStr = sizeMb ? `${(sizeMb / 1024).toFixed(1)} GB` : "";
+					statusSuffix = theme.fg("muted", ` ⬇ ${sizeStr}`);
+				}
+			}
+
 			let line = "";
 			if (isSelected) {
 				const prefix = theme.fg("accent", "→ ");
 				const modelText = `${item.id}`;
 				const providerBadge = theme.fg("muted", `[${item.provider}]`);
 				const checkmark = isCurrent ? theme.fg("success", " ✓") : "";
-				line = `${prefix + theme.fg("accent", modelText)} ${providerBadge}${checkmark}`;
+				line = `${prefix + theme.fg("accent", modelText)} ${providerBadge}${checkmark}${statusSuffix}`;
 			} else {
 				const modelText = `  ${item.id}`;
 				const providerBadge = theme.fg("muted", `[${item.provider}]`);
 				const checkmark = isCurrent ? theme.fg("success", " ✓") : "";
-				line = `${modelText} ${providerBadge}${checkmark}`;
+				line = `${modelText} ${providerBadge}${checkmark}${statusSuffix}`;
 			}
 
 			this.listContainer.addChild(new Text(line, 0, 0));
@@ -326,9 +407,46 @@ export class ModelSelectorComponent extends Container implements Focusable {
 	}
 
 	private handleSelect(model: Model<any>): void {
+		const selectedItem = this.filteredModels[this.selectedIndex];
+		const info = selectedItem?.localInfo;
+
+		// If this is an uncached local model, download it first
+		if (selectedItem?.provider === FOUNDRY_LOCAL_PROVIDER && info && !info.isCached) {
+			this.downloadAndSelect(selectedItem, model);
+			return;
+		}
+
 		// Save as new default
 		this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
 		this.onSelectCallback(model);
+	}
+
+	private async downloadAndSelect(item: ModelItem, model: Model<any>): Promise<void> {
+		const fl = this.modelRegistry.foundryLocal;
+
+		// Show download progress in the list
+		const progressText = new Text(theme.fg("accent", `  Downloading ${item.id}...`), 0, 0);
+		this.listContainer.clear();
+		this.listContainer.addChild(progressText);
+		this.tui.requestRender();
+
+		try {
+			await fl.downloadModel(item.id, (pct) => {
+				progressText.setText(theme.fg("accent", `  Downloading ${item.id}... ${Math.round(pct)}%`));
+				this.tui.requestRender();
+			});
+
+			// Mark as cached and select
+			if (item.localInfo) {
+				item.localInfo.isCached = true;
+			}
+			this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
+			this.onSelectCallback(model);
+		} catch (error) {
+			this.errorMessage = `Download failed: ${error instanceof Error ? error.message : String(error)}`;
+			this.updateList();
+			this.tui.requestRender();
+		}
 	}
 
 	getSearchInput(): Input {

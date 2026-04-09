@@ -1,0 +1,44 @@
+{
+	"name": "@mariozechner/pi-local",
+	"version": "0.65.2",
+	"description": "Local model runtime for Pi — catalog discovery, download, and inference via Foundry Local SDK",
+	"type": "module",
+	"main": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"files": [
+		"dist",
+		"README.md"
+	],
+	"scripts": {
+		"clean": "shx rm -rf dist",
+		"build": "tsgo -p tsconfig.build.json",
+		"dev": "tsgo -p tsconfig.build.json --watch --preserveWatchOutput",
+		"test": "vitest --run",
+		"prepublishOnly": "npm run clean && npm run build"
+	},
+	"dependencies": {
+		"foundry-local-sdk": "^0.9.0",
+		"koffi": "^2.9.0"
+	},
+	"peerDependencies": {
+		"@mariozechner/pi-ai": "^0.65.2"
+	},
+	"keywords": [
+		"ai",
+		"local",
+		"llm",
+		"foundry",
+		"onnx",
+		"on-device"
+	],
+	"author": "Mario Zechner",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/badlogic/pi-mono.git",
+		"directory": "packages/local"
+	},
+	"engines": {
+		"node": ">=20.0.0"
+	}
+}

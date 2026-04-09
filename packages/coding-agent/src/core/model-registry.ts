@@ -18,6 +18,7 @@ import {
 	type SimpleStreamOptions,
 } from "@mariozechner/pi-ai";
 import { registerOAuthProvider, resetOAuthProviders } from "@mariozechner/pi-ai/oauth";
+import { FOUNDRY_LOCAL_PROVIDER, FoundryLocalManager } from "@mariozechner/pi-local";
 import { type Static, Type } from "@sinclair/typebox";
 import AjvModule from "ajv";
 import { existsSync, readFileSync } from "fs";
@@ -258,6 +259,15 @@ export class ModelRegistry {
 	private modelRequestHeaders: Map<string, Record<string, string>> = new Map();
 	private registeredProviders: Map<string, ProviderConfigInput> = new Map();
 	private loadError: string | undefined = undefined;
+	private _foundryLocal?: FoundryLocalManager;
+
+	/** Lazy-initialized Foundry Local manager for local model support. */
+	get foundryLocal(): FoundryLocalManager {
+		if (!this._foundryLocal) {
+			this._foundryLocal = new FoundryLocalManager();
+		}
+		return this._foundryLocal;
+	}
 
 	private constructor(
 		readonly authStorage: AuthStorage,
@@ -535,6 +545,7 @@ export class ModelRegistry {
 	 * Get API key for a model.
 	 */
 	hasConfiguredAuth(model: Model<Api>): boolean {
+		if (model.provider === FOUNDRY_LOCAL_PROVIDER) return true;
 		return (
 			this.authStorage.hasAuth(model.provider) ||
 			this.providerRequestConfigs.get(model.provider)?.apiKey !== undefined
@@ -577,6 +588,9 @@ export class ModelRegistry {
 	 * Get API key and request headers for a model.
 	 */
 	async getApiKeyAndHeaders(model: Model<Api>): Promise<ResolvedRequestAuth> {
+		if (model.provider === FOUNDRY_LOCAL_PROVIDER) {
+			return { ok: true, apiKey: "local" };
+		}
 		try {
 			const providerConfig = this.providerRequestConfigs.get(model.provider);
 			const apiKeyFromAuthStorage = await this.authStorage.getApiKey(model.provider, { includeFallback: false });
@@ -757,6 +771,13 @@ export class ModelRegistry {
 				};
 			});
 		}
+	}
+
+	/**
+	 * Replace local models in the registry with the given set.
+	 */
+	setFoundryLocalModels(localModels: Model<Api>[]) {
+		this.models = [...this.models.filter((m) => m.provider !== FOUNDRY_LOCAL_PROVIDER), ...localModels];
 	}
 }
 

@@ -717,6 +717,8 @@ export class AgentSession {
 	dispose(): void {
 		this._disconnectFromAgent();
 		this._eventListeners = [];
+		// Clean up Foundry Local resources (web service, loaded models)
+		this._modelRegistry.foundryLocal.cleanup();
 	}
 
 	// =========================================================================
