@@ -716,8 +716,12 @@ export class ModelRegistry {
 	}
 
 	private applyProviderConfig(providerName: string, config: ProviderConfigInput): void {
-		// Store lifecycle provider if present
+		// Store lifecycle provider if present, disposing any previous instance
 		if (config.lifecycle) {
+			const existing = this.lifecycleProviders.get(providerName);
+			if (existing) {
+				existing.dispose().catch(() => {});
+			}
 			this.lifecycleProviders.set(providerName, config.lifecycle);
 		}
 
@@ -857,7 +861,13 @@ export class ModelRegistry {
 	async prepareLifecycleModel(provider: string, modelId: string): Promise<{ baseUrl: string } | undefined> {
 		const lifecycle = this.lifecycleProviders.get(provider);
 		if (!lifecycle) return undefined;
-		return lifecycle.prepareForStreaming(modelId);
+		try {
+			return await lifecycle.prepareForStreaming(modelId);
+		} catch (error) {
+			throw new Error(
+				`Failed to prepare local model "${modelId}": ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
 	}
 
 	/** Dispose all lifecycle providers. Uses allSettled so one failure doesn't block others. */
