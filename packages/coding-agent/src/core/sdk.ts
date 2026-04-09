@@ -233,13 +233,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		});
 		model = result.model;
 		if (!model) {
-			// Check if local models are available even though no cloud model was found
-			const hasLocalModels = modelRegistry.getAvailable().some((m) => m.provider === "local");
-			if (hasLocalModels) {
-				modelFallbackMessage = "Use Pi's built-in local models. Use /model to select one.";
-			} else {
-				modelFallbackMessage = `No models available. Use /login or set an API key environment variable. See ${join(getDocsPath(), "providers.md")}. Then use /model to select a model.`;
-			}
+			modelFallbackMessage = `No models available. Use /login or set an API key environment variable. See ${join(getDocsPath(), "providers.md")}. Then use /model to select a model.`;
+		} else if (model.provider === "local" && !modelFallbackMessage) {
+			// Local model auto-selected — show a friendly hint
+			modelFallbackMessage = `Using local model ${model.id}. Use /model to select a different one.`;
 		} else if (modelFallbackMessage) {
 			modelFallbackMessage += `. Using ${model.provider}/${model.id}`;
 		}
