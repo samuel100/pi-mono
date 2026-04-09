@@ -179,15 +179,24 @@ export class FoundryLocalProvider {
 					output.content.push({ type: "text", text: "" });
 					const loadingIdx = output.content.length - 1;
 					stream.push({ type: "text_start", contentIndex: loadingIdx, partial: output });
-					const loadingMsg = `Loading ${model.id} into memory...`;
+					const loadingMsg = `Loading ${model.id} into memory...\n`;
 					(output.content[loadingIdx] as any).text = loadingMsg;
 					stream.push({ type: "text_delta", contentIndex: loadingIdx, delta: loadingMsg, partial: output });
+
+					// Yield event loop so TUI can render the loading message
+					// before the blocking FFI model.load() call
+					await new Promise((resolve) => setTimeout(resolve, 50));
 				}
 
 				const chatClient = await this.getChatClient(model.id);
 
-				// Clear loading message and reset content for actual response
+				// End loading text block and reset content for actual response
 				if (needsLoad) {
+					const loadingIdx = 0;
+					const textBlock = output.content[loadingIdx];
+					if (textBlock?.type === "text") {
+						stream.push({ type: "text_end", contentIndex: loadingIdx, content: textBlock.text, partial: output });
+					}
 					output.content = [];
 				}
 
@@ -413,9 +422,11 @@ function convertContextToOpenAI(context: Context): any[] {
 		} else if (msg.role === "assistant") {
 			const textParts = msg.content.filter((c) => c.type === "text");
 			const toolCalls = msg.content.filter((c) => c.type === "toolCall") as ToolCall[];
+			// SDK requires content to be a non-empty string — use space as placeholder
+			const textContent = textParts.length > 0 ? textParts.map((c) => (c as any).text).join("") : " ";
 			const assistantMsg: any = {
 				role: "assistant",
-				content: textParts.length > 0 ? textParts.map((c) => (c as any).text).join("") : null,
+				content: textContent || " ",
 			};
 			if (toolCalls.length > 0) {
 				assistantMsg.tool_calls = toolCalls.map((tc) => ({
