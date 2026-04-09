@@ -417,6 +417,11 @@ export class ModelSelectorComponent extends Container implements Focusable {
 			return;
 		}
 
+		// For cached local models, eagerly start web service + load model
+		if (model.provider === FOUNDRY_LOCAL_PROVIDER) {
+			this.modelRegistry.foundryLocal.prepareModel(model.id).catch(() => {});
+		}
+
 		// Save as new default
 		this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
 		this.onSelectCallback(model);
@@ -437,10 +442,11 @@ export class ModelSelectorComponent extends Container implements Focusable {
 				this.tui.requestRender();
 			});
 
-			// Mark as cached and select
+			// Mark as cached, eagerly load, and select
 			if (item.localInfo) {
 				item.localInfo.isCached = true;
 			}
+			fl.prepareModel(item.id).catch(() => {});
 			this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
 			this.onSelectCallback(model);
 		} catch (error) {
