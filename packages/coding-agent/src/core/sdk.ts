@@ -305,7 +305,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		streamFn: async (model, context, options) => {
 			// Local models: ensure web service is running and model is loaded
 			if (model.provider === FOUNDRY_LOCAL_PROVIDER) {
-				await modelRegistry.foundryLocal.prepareModel(model.id);
+				const baseUrl = await modelRegistry.foundryLocal.prepareModel(model.id);
+				model = { ...model, baseUrl: `${baseUrl}/v1` };
 			}
 			const auth = await modelRegistry.getApiKeyAndHeaders(model);
 			if (!auth.ok) {
