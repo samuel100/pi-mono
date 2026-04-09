@@ -232,11 +232,17 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			modelRegistry,
 		});
 		model = result.model;
+		// Don't auto-select a local model — let the user pick via /model
+		if (model?.provider === "local") {
+			model = undefined;
+		}
 		if (!model) {
-			modelFallbackMessage = `No models available. Use /login or set an API key environment variable. See ${join(getDocsPath(), "providers.md")}. Then use /model to select a model.`;
-		} else if (model.provider === "local" && !modelFallbackMessage) {
-			// Local model auto-selected — show a friendly hint
-			modelFallbackMessage = `Using local model ${model.id}. Use /model to select a different one.`;
+			const hasLocalModels = modelRegistry.getAvailable().some((m) => m.provider === "local");
+			if (hasLocalModels) {
+				modelFallbackMessage = "Local models are available to download. Use /model to select one.";
+			} else {
+				modelFallbackMessage = `No models available. Use /login or set an API key environment variable. See ${join(getDocsPath(), "providers.md")}. Then use /model to select a model.`;
+			}
 		} else if (modelFallbackMessage) {
 			modelFallbackMessage += `. Using ${model.provider}/${model.id}`;
 		}
