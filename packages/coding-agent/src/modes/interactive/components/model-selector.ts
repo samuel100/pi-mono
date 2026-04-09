@@ -193,7 +193,7 @@ export class ModelSelectorComponent extends Container implements Focusable {
 				const registeredIds = new Set(models.filter((m) => m.provider === FOUNDRY_LOCAL_PROVIDER).map((m) => m.id));
 				for (const info of catalogModels) {
 					if (!registeredIds.has(info.alias)) {
-						const piModels = fl.buildPiModels([info], fl.getBaseUrl() ?? "http://127.0.0.1:5273");
+						const piModels = fl.buildPiModels([info]);
 						if (piModels.length > 0) {
 							models.push({
 								provider: FOUNDRY_LOCAL_PROVIDER,
@@ -419,7 +419,7 @@ export class ModelSelectorComponent extends Container implements Focusable {
 
 		// For uncached Foundry Local models, download and load first
 		if (isLocal && localInfo && !localInfo.isCached) {
-			if (this.downloading) return; // Prevent double-click
+			if (this.downloading) return;
 			this.downloading = true;
 			this.setStatusText(`Downloading ${model.id}...`);
 			this.tui.requestRender();
@@ -428,26 +428,18 @@ export class ModelSelectorComponent extends Container implements Focusable {
 
 			(async () => {
 				try {
-					// Ensure service is running
-					await fl.ensureServiceRunning();
-
-					// Download with progress
 					await fl.downloadModel(model.id, (percent: number) => {
 						this.setStatusText(`Downloading ${model.id}... ${percent.toFixed(0)}%`);
 						this.tui.requestRender();
 					});
 
-					// Load model on the service
 					this.setStatusText(`Loading ${model.id}...`);
 					this.tui.requestRender();
 					await fl.loadModel(model.id);
 
-					// Update local info cache
-					if (localInfo) localInfo.isCached = true;
+					localInfo.isCached = true;
 
-					// Register model in registry and select it
-					const baseUrl = fl.getBaseUrl() ?? "http://127.0.0.1:5273";
-					const piModels = fl.buildPiModels([localInfo], baseUrl);
+					const piModels = fl.buildPiModels([localInfo]);
 					if (piModels.length > 0) {
 						this.modelRegistry.setFoundryLocalModels(piModels);
 						const registeredModel = this.modelRegistry.find(FOUNDRY_LOCAL_PROVIDER, model.id);
@@ -468,20 +460,17 @@ export class ModelSelectorComponent extends Container implements Focusable {
 			return;
 		}
 
-		// For cached local models, ensure loaded on service
+		// For cached local models, load in-process and select
 		if (isLocal) {
 			const fl = this.modelRegistry.foundryLocal;
 			(async () => {
 				try {
-					const baseUrl = await fl.ensureServiceRunning();
 					this.setStatusText(`Loading ${model.id}...`);
 					this.tui.requestRender();
 					await fl.loadModel(model.id);
 
-					// Update model baseUrl to match running service
-					const updatedModel = { ...model, baseUrl: `${baseUrl}/v1` };
-					this.settingsManager.setDefaultModelAndProvider(updatedModel.provider, updatedModel.id);
-					this.onSelectCallback(updatedModel);
+					this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
+					this.onSelectCallback(model);
 				} catch (error) {
 					this.setStatusText(
 						theme.fg("error", `Failed: ${error instanceof Error ? error.message : String(error)}`),

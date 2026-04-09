@@ -279,7 +279,7 @@ export class ModelRegistry {
 	/** Get the Foundry Local provider instance (lazy-created). */
 	get foundryLocal(): FoundryLocalProvider {
 		if (!this._foundryLocal) {
-			this._foundryLocal = new FoundryLocalProvider(getAgentDir());
+			this._foundryLocal = new FoundryLocalProvider();
 		}
 		return this._foundryLocal;
 	}

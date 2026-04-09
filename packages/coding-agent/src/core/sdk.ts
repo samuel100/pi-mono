@@ -297,21 +297,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		},
 		convertToLlm: convertToLlmWithBlockImages,
 		streamFn: async (model, context, options) => {
-			// For Foundry Local models, ensure the service is running and model is loaded
+			// For Foundry Local models, use native SDK streaming (no HTTP)
 			if (model.provider === "foundry-local") {
 				const fl = modelRegistry.foundryLocal;
-				try {
-					const baseUrl = await fl.ensureServiceRunning();
-					// Ensure the model is loaded on the service
-					const loaded = await fl.listLoadedModels();
-					if (!loaded.includes(model.id)) {
-						await fl.loadModel(model.id);
-					}
-					// Update baseUrl to match the running service
-					model = { ...model, baseUrl: `${baseUrl}/v1` };
-				} catch (error) {
-					throw new Error(`Foundry Local: ${error instanceof Error ? error.message : String(error)}`);
-				}
+				return fl.streamChat(model, context, options);
 			}
 			const auth = await modelRegistry.getApiKeyAndHeaders(model);
 			if (!auth.ok) {

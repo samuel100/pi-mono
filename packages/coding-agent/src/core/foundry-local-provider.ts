@@ -1,29 +1,29 @@
 /**
- * Foundry Local provider — manages the Foundry Local service process and
- * exposes its models as a built-in Pi provider.
+ * Foundry Local provider — in-process SDK integration.
  *
  * Architecture:
- *   - A detached service process runs Foundry Local's embedded web service
- *     (OpenAI-compatible v1/chat/completions endpoint + model management).
- *   - Pi CLI uses the SDK for catalog discovery and model downloading
- *     (these are network/file operations that don't need inference).
- *   - Pi CLI uses HTTP for model load/unload and inference on the service.
- *   - Pi's existing openai-completions provider handles SSE and tool calling.
+ *   - FoundryLocalManager runs in the Pi process (no separate service).
+ *   - SDK handles catalog discovery, model download, load/unload.
+ *   - Native chatClient.completeStreamingChat() for inference (no HTTP).
+ *   - Models stay loaded for the duration of the Pi TUI session.
  */
 
-import { type ChildProcess, fork, spawn } from "node:child_process";
-import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import { createRequire } from "node:module";
-import { join } from "node:path";
-import { fileURLToPath } from "node:url";
-import type { Model, OpenAICompletionsCompat } from "@mariozechner/pi-ai";
+import type {
+	AssistantMessage,
+	AssistantMessageEventStream,
+	Context,
+	Model,
+	OpenAICompletionsCompat,
+	SimpleStreamOptions,
+	ToolCall,
+} from "@mariozechner/pi-ai";
+import { calculateCost, createAssistantMessageEventStream } from "@mariozechner/pi-ai";
 
-const __dirname = fileURLToPath(new URL(".", import.meta.url));
 const cjsRequire = createRequire(import.meta.url);
 
 export const FOUNDRY_LOCAL_PROVIDER = "foundry-local" as const;
 
-/** Compat settings for Foundry Local's OpenAI-compatible web service. */
 const FOUNDRY_LOCAL_COMPAT: OpenAICompletionsCompat = {
 	supportsDeveloperRole: false,
 	supportsReasoningEffort: false,
@@ -32,7 +32,6 @@ const FOUNDRY_LOCAL_COMPAT: OpenAICompletionsCompat = {
 	supportsStrictMode: false,
 };
 
-/** Information about a model in the Foundry Local catalog. */
 export interface LocalModelInfo {
 	alias: string;
 	displayName: string;
@@ -43,30 +42,12 @@ export interface LocalModelInfo {
 	maxOutputTokens: number | null;
 }
 
-/** Lockfile written by the service process. */
-interface ServiceLockfile {
-	pid: number;
-	port: number;
-	urls: string[];
-	startedAt: string;
-}
-
-const SERVICE_START_TIMEOUT_MS = 30_000;
-
 export class FoundryLocalProvider {
-	private lockfilePath: string;
-	private baseUrl: string | null = null;
 	private sdkAvailable: boolean | null = null;
 	private sdkManager: any = null;
 	private catalogAliases: Set<string> = new Set();
+	private loadedChatClients: Map<string, any> = new Map();
 
-	constructor(agentDir: string) {
-		this.lockfilePath = join(agentDir, "foundry-local-service.json");
-	}
-
-	/**
-	 * Check if the Foundry Local SDK native binaries are available.
-	 */
 	isAvailable(): boolean {
 		if (this.sdkAvailable !== null) return this.sdkAvailable;
 		try {
@@ -78,46 +59,11 @@ export class FoundryLocalProvider {
 		return this.sdkAvailable;
 	}
 
-	/** Get the base URL of the running service, or null if not connected. */
-	getBaseUrl(): string | null {
-		return this.baseUrl;
-	}
+	// ── SDK manager ──────────────────────────────────────────────────────
 
-	// ── Service lifecycle (spawn / connect) ──────────────────────────────
-
-	/**
-	 * Ensure the Foundry Local service process is running.
-	 * Reads the lockfile to find an existing service, or spawns a new one.
-	 */
-	async ensureServiceRunning(): Promise<string> {
-		if (this.baseUrl && (await this.healthCheck(this.baseUrl))) {
-			return this.baseUrl;
-		}
-
-		const existing = this.readLockfile();
-		if (existing) {
-			const url = existing.urls[0];
-			if (await this.healthCheck(url)) {
-				this.baseUrl = url;
-				return url;
-			}
-			this.removeLockfile();
-		}
-
-		return this.spawnService();
-	}
-
-	// ── Catalog + Download (SDK-based, runs in Pi CLI process) ───────────
-
-	/**
-	 * Get or create the FoundryLocalManager singleton for catalog/download operations.
-	 * Suppresses the native core's init log that would corrupt the TUI.
-	 */
 	private async getOrCreateManager(): Promise<any> {
 		if (this.sdkManager) return this.sdkManager;
 		const { FoundryLocalManager } = await import("foundry-local-sdk");
-
-		// Suppress native core's "Service configuration complete." log
 		const origWrite = process.stdout.write;
 		process.stdout.write = (() => true) as any;
 		try {
@@ -131,18 +77,12 @@ export class FoundryLocalProvider {
 		return this.sdkManager;
 	}
 
-	/**
-	 * Query the full Foundry Local catalog for all available models
-	 * (including those not yet cached/downloaded).
-	 * Uses the SDK directly — /v1/models only returns cached models.
-	 */
+	// ── Catalog + Download ───────────────────────────────────────────────
+
 	async getCatalogModels(): Promise<LocalModelInfo[]> {
 		if (!this.isAvailable()) return [];
-
 		try {
 			const manager = await this.getOrCreateManager();
-			// Reset the catalog's time-based cache so isCached reflects current disk state.
-			// The catalog caches for 6 hours; we need fresh data each time the selector opens.
 			(manager.catalog as any).lastFetch = 0;
 			const models = await manager.catalog.getModels();
 			const results = models.map((m: any) => ({
@@ -154,7 +94,6 @@ export class FoundryLocalProvider {
 				contextLength: null,
 				maxOutputTokens: null,
 			}));
-			// Cache aliases for mapping variant IDs to aliases in listLoadedModels
 			this.catalogAliases = new Set(results.map((m: LocalModelInfo) => m.alias));
 			return results;
 		} catch (error) {
@@ -165,10 +104,6 @@ export class FoundryLocalProvider {
 		}
 	}
 
-	/**
-	 * Download a model from the Foundry Local catalog.
-	 * Uses the SDK directly for download with progress tracking.
-	 */
 	async downloadModel(alias: string, onProgress?: (percent: number) => void): Promise<void> {
 		const manager = await this.getOrCreateManager();
 		(manager.catalog as any).lastFetch = 0;
@@ -178,62 +113,30 @@ export class FoundryLocalProvider {
 		}
 	}
 
-	// ── Load / Unload / Inference (HTTP to the long-lived service) ───────
+	// ── Model load / unload (in-process) ─────────────────────────────────
 
-	/**
-	 * Load an already-cached model on the service.
-	 * The model must be downloaded first via downloadModel().
-	 */
-	async loadModel(name: string): Promise<void> {
-		if (!this.baseUrl) throw new Error("Service not running");
-		const response = await fetch(`${this.baseUrl}/models/load/${encodeURIComponent(name)}`, {
-			signal: AbortSignal.timeout(60_000),
-		});
-		if (!response.ok) {
-			const text = await response.text().catch(() => response.statusText);
-			throw new Error(`Failed to load model '${name}': ${text}`);
+	async loadModel(alias: string): Promise<void> {
+		const manager = await this.getOrCreateManager();
+		(manager.catalog as any).lastFetch = 0;
+		const model = await manager.catalog.getModel(alias);
+		if (!(await model.isLoaded())) {
+			await model.load();
 		}
 	}
 
-	/** Unload a model from the service. */
-	async unloadModel(name: string): Promise<void> {
-		if (!this.baseUrl) throw new Error("Service not running");
-		const response = await fetch(`${this.baseUrl}/models/unload/${encodeURIComponent(name)}`, {
-			signal: AbortSignal.timeout(30_000),
-		});
-		if (!response.ok) {
-			const text = await response.text().catch(() => response.statusText);
-			throw new Error(`Failed to unload model '${name}': ${text}`);
-		}
-	}
-
-	/** List model aliases currently loaded on the service. */
 	async listLoadedModels(): Promise<string[]> {
-		if (!this.baseUrl) return [];
+		if (!this.sdkManager) return [];
 		try {
-			const response = await fetch(`${this.baseUrl}/models/loaded`, {
-				signal: AbortSignal.timeout(5_000),
-			});
-			if (!response.ok) return [];
-			const variantIds = (await response.json()) as string[];
-
-			// Map variant IDs back to aliases.
-			// Variant IDs look like "qwen2.5-7b-instruct-generic-gpu:4",
-			// aliases look like "qwen2.5-7b". Match by prefix.
+			const models = await this.sdkManager.catalog.getLoadedModels();
 			const loadedAliases: string[] = [];
-			for (const variantId of variantIds) {
-				let matched = false;
-				// Sort aliases longest-first so "qwen2.5-coder-7b" matches before "qwen2.5"
+			for (const m of models) {
+				const id: string = m.id ?? m.alias ?? "";
 				const sortedAliases = [...this.catalogAliases].sort((a, b) => b.length - a.length);
 				for (const alias of sortedAliases) {
-					if (variantId.startsWith(alias)) {
+					if (id.startsWith(alias)) {
 						loadedAliases.push(alias);
-						matched = true;
 						break;
 					}
-				}
-				if (!matched) {
-					loadedAliases.push(variantId);
 				}
 			}
 			return loadedAliases;
@@ -242,27 +145,199 @@ export class FoundryLocalProvider {
 		}
 	}
 
-	/**
-	 * Ensure a model is downloaded and loaded on the service.
-	 * Downloads via SDK if not cached, then loads via HTTP.
-	 */
-	async ensureModelReady(alias: string, onProgress?: (percent: number) => void): Promise<void> {
-		await this.downloadModel(alias, onProgress);
-		await this.loadModel(alias);
+	// ── Streaming inference (native FFI) ─────────────────────────────────
+
+	streamChat(model: Model<any>, context: Context, _options?: SimpleStreamOptions): AssistantMessageEventStream {
+		const stream = createAssistantMessageEventStream();
+
+		(async () => {
+			const output: AssistantMessage = {
+				role: "assistant",
+				content: [],
+				api: model.api,
+				provider: model.provider,
+				model: model.id,
+				usage: {
+					input: 0,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 0,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "stop",
+				timestamp: Date.now(),
+			};
+
+			try {
+				const chatClient = await this.getChatClient(model.id);
+				const messages = convertContextToOpenAI(context);
+				const tools = context.tools ? convertToolsToOpenAI(context.tools) : undefined;
+
+				stream.push({ type: "start", partial: output });
+
+				let currentTextIndex = -1;
+				const toolCallAccumulators: Map<number, { id: string; name: string; args: string }> = new Map();
+
+				for await (const chunk of chatClient.completeStreamingChat(messages, tools)) {
+					const choice = chunk.choices?.[0];
+					if (!choice) continue;
+					const delta = choice.delta;
+
+					// Text content
+					if (delta?.content) {
+						if (currentTextIndex === -1) {
+							output.content.push({ type: "text", text: "" });
+							currentTextIndex = output.content.length - 1;
+							stream.push({ type: "text_start", contentIndex: currentTextIndex, partial: output });
+						}
+						const textBlock = output.content[currentTextIndex];
+						if (textBlock.type === "text") {
+							textBlock.text += delta.content;
+						}
+						stream.push({
+							type: "text_delta",
+							contentIndex: currentTextIndex,
+							delta: delta.content,
+							partial: output,
+						});
+					}
+
+					// Tool calls
+					if (delta?.tool_calls) {
+						if (currentTextIndex !== -1) {
+							const textBlock = output.content[currentTextIndex];
+							if (textBlock.type === "text") {
+								stream.push({
+									type: "text_end",
+									contentIndex: currentTextIndex,
+									content: textBlock.text,
+									partial: output,
+								});
+							}
+							currentTextIndex = -1;
+						}
+
+						for (const tc of delta.tool_calls) {
+							const idx = tc.index ?? 0;
+							if (!toolCallAccumulators.has(idx)) {
+								toolCallAccumulators.set(idx, {
+									id: tc.id ?? `call_${idx}`,
+									name: tc.function?.name ?? "",
+									args: "",
+								});
+								output.content.push({
+									type: "toolCall",
+									id: tc.id ?? `call_${idx}`,
+									name: tc.function?.name ?? "",
+									arguments: {},
+								});
+								stream.push({
+									type: "toolcall_start",
+									contentIndex: output.content.length - 1,
+									partial: output,
+								});
+							}
+							const acc = toolCallAccumulators.get(idx)!;
+							if (tc.function?.name) acc.name = tc.function.name;
+							if (tc.function?.arguments) {
+								acc.args += tc.function.arguments;
+								const contentIdx = output.content.findIndex(
+									(c) => c.type === "toolCall" && (c as ToolCall).id === acc.id,
+								);
+								if (contentIdx !== -1) {
+									stream.push({
+										type: "toolcall_delta",
+										contentIndex: contentIdx,
+										delta: tc.function.arguments,
+										partial: output,
+									});
+								}
+							}
+						}
+					}
+
+					// Finish
+					if (choice.finish_reason) {
+						if (currentTextIndex !== -1) {
+							const textBlock = output.content[currentTextIndex];
+							if (textBlock.type === "text") {
+								stream.push({
+									type: "text_end",
+									contentIndex: currentTextIndex,
+									content: textBlock.text,
+									partial: output,
+								});
+							}
+						}
+
+						for (const [, acc] of toolCallAccumulators) {
+							let parsedArgs = {};
+							try {
+								parsedArgs = JSON.parse(acc.args);
+							} catch {
+								/* empty */
+							}
+							const contentIdx = output.content.findIndex(
+								(c) => c.type === "toolCall" && (c as ToolCall).id === acc.id,
+							);
+							if (contentIdx !== -1) {
+								const tc = output.content[contentIdx] as ToolCall;
+								tc.name = acc.name;
+								tc.arguments = parsedArgs;
+								stream.push({ type: "toolcall_end", contentIndex: contentIdx, toolCall: tc, partial: output });
+							}
+						}
+
+						output.stopReason =
+							choice.finish_reason === "tool_calls"
+								? "toolUse"
+								: choice.finish_reason === "length"
+									? "length"
+									: "stop";
+					}
+
+					if (chunk.usage) {
+						output.usage.input = chunk.usage.prompt_tokens ?? 0;
+						output.usage.output = chunk.usage.completion_tokens ?? 0;
+						output.usage.totalTokens = chunk.usage.total_tokens ?? output.usage.input + output.usage.output;
+						calculateCost(model, output.usage);
+					}
+				}
+
+				stream.push({ type: "done", reason: output.stopReason as "stop" | "length" | "toolUse", message: output });
+				stream.end(output);
+			} catch (error) {
+				output.stopReason = "error";
+				output.errorMessage = error instanceof Error ? error.message : String(error);
+				stream.push({ type: "error", reason: "error", error: output });
+				stream.end(output);
+			}
+		})();
+
+		return stream;
+	}
+
+	private async getChatClient(alias: string): Promise<any> {
+		if (this.loadedChatClients.has(alias)) return this.loadedChatClients.get(alias)!;
+		const manager = await this.getOrCreateManager();
+		(manager.catalog as any).lastFetch = 0;
+		const model = await manager.catalog.getModel(alias);
+		if (!(await model.isLoaded())) await model.load();
+		const client = model.createChatClient();
+		this.loadedChatClients.set(alias, client);
+		return client;
 	}
 
 	// ── Pi model mapping ─────────────────────────────────────────────────
 
-	/**
-	 * Convert catalog models to pi-ai Model objects for registration.
-	 */
-	buildPiModels(catalogModels: LocalModelInfo[], baseUrl: string): Model<"openai-completions">[] {
+	buildPiModels(catalogModels: LocalModelInfo[]): Model<"openai-completions">[] {
 		return catalogModels.map((m) => ({
 			id: m.alias,
 			name: `${m.displayName} (Foundry Local)`,
 			api: "openai-completions" as const,
 			provider: FOUNDRY_LOCAL_PROVIDER,
-			baseUrl: `${baseUrl}/v1`,
+			baseUrl: "local://foundry",
 			reasoning: false,
 			input: ["text" as const],
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -271,99 +346,58 @@ export class FoundryLocalProvider {
 			compat: FOUNDRY_LOCAL_COMPAT,
 		}));
 	}
+}
 
-	// ── Private helpers ──────────────────────────────────────────────────
+// ── Context conversion helpers ───────────────────────────────────────────
 
-	private readLockfile(): ServiceLockfile | null {
-		try {
-			if (!existsSync(this.lockfilePath)) return null;
-			return JSON.parse(readFileSync(this.lockfilePath, "utf-8")) as ServiceLockfile;
-		} catch {
-			return null;
-		}
+function convertContextToOpenAI(context: Context): any[] {
+	const messages: any[] = [];
+	if (context.systemPrompt) {
+		messages.push({ role: "system", content: context.systemPrompt });
 	}
-
-	private removeLockfile(): void {
-		try {
-			if (existsSync(this.lockfilePath)) unlinkSync(this.lockfilePath);
-		} catch {
-			// Ignore
-		}
-	}
-
-	private async healthCheck(url: string): Promise<boolean> {
-		try {
-			const response = await fetch(`${url}/models/loaded`, {
-				signal: AbortSignal.timeout(3_000),
-			});
-			return response.ok;
-		} catch {
-			return false;
-		}
-	}
-
-	private async spawnService(): Promise<string> {
-		// Resolve the service script path. When running from source (tsx), __dirname
-		// points to the .ts source. When running compiled, it points to dist/.
-		// We try the .js path first (compiled), then fall back to .ts via tsx.
-		const jsPath = join(__dirname, "foundry-local-service.js");
-		const tsPath = join(__dirname, "foundry-local-service.ts");
-		const useTs = !existsSync(jsPath) && existsSync(tsPath);
-		const servicePath = useTs ? tsPath : jsPath;
-
-		return new Promise<string>((resolve, reject) => {
-			const timeout = setTimeout(() => {
-				reject(new Error(`Foundry Local service did not start within ${SERVICE_START_TIMEOUT_MS / 1000}s`));
-			}, SERVICE_START_TIMEOUT_MS);
-
-			let child: ChildProcess;
-			if (useTs) {
-				// Running from source — use tsx to execute the TypeScript service
-				const tsxBin = join(__dirname, "..", "..", "..", "..", "node_modules", ".bin", "tsx");
-				child = spawn(tsxBin, [servicePath, this.lockfilePath], {
-					detached: true,
-					stdio: ["ignore", "pipe", "ignore"],
-				});
-				child.unref();
-			} else {
-				child = fork(servicePath, [this.lockfilePath], {
-					detached: true,
-					stdio: ["ignore", "pipe", "ignore", "ipc"],
-				});
+	for (const msg of context.messages) {
+		if (msg.role === "user") {
+			const content =
+				typeof msg.content === "string"
+					? msg.content
+					: msg.content
+							.filter((c) => c.type === "text")
+							.map((c) => (c as any).text)
+							.join("\n");
+			messages.push({ role: "user", content });
+		} else if (msg.role === "assistant") {
+			const textParts = msg.content.filter((c) => c.type === "text");
+			const toolCalls = msg.content.filter((c) => c.type === "toolCall") as ToolCall[];
+			const assistantMsg: any = {
+				role: "assistant",
+				content: textParts.length > 0 ? textParts.map((c) => (c as any).text).join("") : null,
+			};
+			if (toolCalls.length > 0) {
+				assistantMsg.tool_calls = toolCalls.map((tc) => ({
+					id: tc.id,
+					type: "function",
+					function: { name: tc.name, arguments: JSON.stringify(tc.arguments) },
+				}));
 			}
-
-			child.unref();
-
-			let stdoutData = "";
-
-			child.stdout?.on("data", (chunk: Buffer) => {
-				stdoutData += chunk.toString();
-				try {
-					const parsed = JSON.parse(stdoutData.trim());
-					if (parsed.ready && parsed.urls?.length > 0) {
-						clearTimeout(timeout);
-						this.baseUrl = parsed.urls[0];
-						// Close stdout pipe and disconnect IPC so child is fully detached
-						child.stdout?.destroy();
-						if (typeof child.disconnect === "function") child.disconnect();
-						resolve(this.baseUrl!);
-					}
-				} catch {
-					// Not yet complete JSON
-				}
+			messages.push(assistantMsg);
+		} else if (msg.role === "toolResult") {
+			const content = msg.content
+				.filter((c) => c.type === "text")
+				.map((c) => (c as any).text)
+				.join("\n");
+			messages.push({
+				role: "tool",
+				tool_call_id: msg.toolCallId,
+				content: content || (msg.isError ? "Error" : "OK"),
 			});
-
-			child.on("error", (err) => {
-				clearTimeout(timeout);
-				reject(new Error(`Failed to spawn Foundry Local service: ${err.message}`));
-			});
-
-			child.on("exit", (code) => {
-				clearTimeout(timeout);
-				if (code !== 0) {
-					reject(new Error(`Foundry Local service exited with code ${code}`));
-				}
-			});
-		});
+		}
 	}
+	return messages;
+}
+
+function convertToolsToOpenAI(tools: any[]): any[] {
+	return tools.map((tool) => ({
+		type: "function",
+		function: { name: tool.name, description: tool.description, parameters: tool.parameters },
+	}));
 }
