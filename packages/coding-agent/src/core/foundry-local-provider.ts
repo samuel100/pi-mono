@@ -213,9 +213,14 @@ export class FoundryLocalProvider {
 				let currentTextIndex = -1;
 				let textBuffer = "";
 				let insideToolCallTag = false;
+				let flushTimer: ReturnType<typeof setTimeout> | null = null;
 				const toolCallAccumulators: Map<number, { id: string; name: string; args: string }> = new Map();
 
 				const flushTextBuffer = () => {
+					if (flushTimer) {
+						clearTimeout(flushTimer);
+						flushTimer = null;
+					}
 					if (!textBuffer) return;
 					// Filter out <tool_call> tags and their JSON content
 					const cleaned = textBuffer
@@ -257,7 +262,13 @@ export class FoundryLocalProvider {
 							// Don't flush while inside a tool call tag
 							return;
 						}
-						flushTextBuffer();
+						// Debounce text flushing — batch tokens for smoother rendering
+						if (!flushTimer) {
+							flushTimer = setTimeout(() => {
+								flushTimer = null;
+								flushTextBuffer();
+							}, 30);
+						}
 					}
 
 					if (delta?.tool_calls) {
