@@ -179,8 +179,27 @@ export class FoundryLocalProvider {
 		(manager.catalog as any).lastFetch = 0;
 		const model = await manager.catalog.getModel(alias);
 		if (!(await model.isLoaded())) {
+			// Unload any previously loaded models to free memory
+			await this.unloadAll();
 			process.stderr.write(`\x1b[33mLoading ${alias} into memory...\x1b[0m\n`);
 			await model.load();
+		}
+	}
+
+	/** Unload all currently loaded models. */
+	async unloadAll(): Promise<void> {
+		if (!this.sdkManager) return;
+		try {
+			const loaded = await this.sdkManager.catalog.getLoadedModels();
+			for (const model of loaded) {
+				try {
+					await model.unload();
+				} catch {
+					// Best-effort
+				}
+			}
+		} catch {
+			// Ignore
 		}
 	}
 
