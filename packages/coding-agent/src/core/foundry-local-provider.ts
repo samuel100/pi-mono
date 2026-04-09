@@ -142,22 +142,15 @@ export class FoundryLocalProvider {
 			(manager.catalog as any).lastFetch = 0;
 			const models = await manager.catalog.getModels();
 			const results = models
-				.map((m: any) => {
-					// IModel.supportsToolCalling is defined in the SDK interface but
-					// returns undefined in v0.9.0. Fall back to internal _modelInfo
-					// until the public getter is implemented in a future SDK release.
-					const stc = m.supportsToolCalling ?? m._variants?.[0]?._modelInfo?.supportsToolCalling ?? false;
-					const info = m._variants?.[0]?._modelInfo;
-					return {
-						alias: m.alias,
-						displayName: m.alias,
-						fileSizeMb: info?.fileSizeMb ?? null,
-						isCached: m.isCached,
-						supportsToolCalling: stc,
-						contextLength: null,
-						maxOutputTokens: info?.maxOutputTokens ?? null,
-					};
-				})
+				.map((m: any) => ({
+					alias: m.alias,
+					displayName: m.alias,
+					fileSizeMb: null,
+					isCached: m.isCached,
+					supportsToolCalling: m.supportsToolCalling ?? false,
+					contextLength: m.contextLength ?? null,
+					maxOutputTokens: null,
+				}))
 				// Only show models that support tool calling (required for Pi's agentic workflows)
 				.filter((m: LocalModelInfo) => m.supportsToolCalling);
 			this.catalogAliases = new Set(results.map((m: LocalModelInfo) => m.alias));
