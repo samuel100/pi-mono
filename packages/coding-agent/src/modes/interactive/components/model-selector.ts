@@ -166,31 +166,32 @@ export class ModelSelectorComponent extends Container implements Focusable {
 			return;
 		}
 
-		// Fetch Foundry Local catalog and merge uncached models
+		// Fetch Foundry Local catalog and merge local models
 		const fl = this.modelRegistry.foundryLocal;
 		if (fl.isAvailable()) {
 			try {
 				const catalog = await fl.getCatalogModels();
 				const loadedModels = await fl.listLoadedModels();
 				const loadedSet = new Set(loadedModels);
+
+				// Filter to tool-calling models only (Pi needs tool use)
+				const toolCapable = catalog.filter((c) => c.supportsToolCalling);
+
+				// Build Pi model objects for all catalog models
+				const baseUrl = fl.getBaseUrl() ?? "http://localhost:5273";
 				const existingLocalIds = new Set(
 					models.filter((m) => m.provider === FOUNDRY_LOCAL_PROVIDER).map((m) => m.id),
 				);
 
-				// Attach localInfo to existing local models
-				for (const item of models) {
-					if (item.provider === FOUNDRY_LOCAL_PROVIDER) {
-						const info = catalog.find((c) => c.alias === item.id);
-						if (info) {
-							item.localInfo = { ...info, isCached: true };
+				for (const info of toolCapable) {
+					if (existingLocalIds.has(info.alias)) {
+						// Attach localInfo to already-registered model
+						const existing = models.find((m) => m.provider === FOUNDRY_LOCAL_PROVIDER && m.id === info.alias);
+						if (existing) {
+							existing.localInfo = info;
 						}
-					}
-				}
-
-				// Add uncached catalog models (not yet in registry)
-				const baseUrl = fl.getBaseUrl() ?? "http://localhost:5273";
-				for (const info of catalog) {
-					if (!existingLocalIds.has(info.alias) && !info.isCached) {
+					} else {
+						// Add new catalog model to list
 						const piModels = fl.buildPiModels([info], baseUrl);
 						if (piModels[0]) {
 							models.push({
@@ -203,7 +204,7 @@ export class ModelSelectorComponent extends Container implements Focusable {
 					}
 				}
 
-				// Mark loaded state in localInfo
+				// Mark loaded state
 				for (const item of models) {
 					if (item.provider === FOUNDRY_LOCAL_PROVIDER && item.localInfo) {
 						(item.localInfo as any)._isLoaded = loadedSet.has(item.id);

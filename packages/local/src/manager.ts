@@ -178,9 +178,7 @@ export class FoundryLocalManager {
 				displayName: m.alias,
 				fileSizeMb: null,
 				isCached: m.isCached,
-				// In SDK 0.9.0, supportsToolCalling getter returns undefined.
-				// Fall back to checking the underlying model info property.
-				supportsToolCalling: m.supportsToolCalling ?? m.info?.supportsToolCalling ?? true,
+				supportsToolCalling: m.selectedVariant?.modelInfo?.supportsToolCalling ?? false,
 				contextLength: m.contextLength ?? null,
 				maxOutputTokens: null,
 			}));
