@@ -439,14 +439,14 @@ function convertContextToOpenAI(context: Context): any[] {
 							.filter((c) => c.type === "text")
 							.map((c) => (c as any).text)
 							.join("\n");
-			messages.push({ role: "user", content: content || " " });
+			messages.push({ role: "user", content: content || "." });
 		} else if (msg.role === "assistant") {
 			const textParts = msg.content.filter((c) => c.type === "text");
 			const toolCalls = msg.content.filter((c) => c.type === "toolCall") as ToolCall[];
 			const textContent = textParts.length > 0 ? textParts.map((c) => (c as any).text).join("") : "";
 			const assistantMsg: any = {
 				role: "assistant",
-				content: textContent || " ",
+				content: textContent || ".",
 			};
 			if (toolCalls.length > 0) {
 				assistantMsg.tool_calls = toolCalls.map((tc) => ({
@@ -468,11 +468,11 @@ function convertContextToOpenAI(context: Context): any[] {
 			});
 		}
 	}
-	// SDK validation requires every message to have non-empty string content.
-	// Ensure no message slips through with empty/null/undefined content.
+	// SDK validation requires every message to have non-empty string content
+	// that passes trim() check. Use "." as a minimal non-whitespace placeholder.
 	for (const msg of messages) {
 		if (!msg.content || (typeof msg.content === "string" && msg.content.trim() === "")) {
-			msg.content = " ";
+			msg.content = ".";
 		}
 	}
 	return messages;
