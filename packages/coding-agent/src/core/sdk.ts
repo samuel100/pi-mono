@@ -177,21 +177,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const authStorage = options.authStorage ?? AuthStorage.create(authPath);
 	const modelRegistry = options.modelRegistry ?? ModelRegistry.create(authStorage, modelsPath);
 
-	// Register Foundry Local models early so they're available at startup
-	// (before findInitialModel checks for available models)
-	const fl = modelRegistry.foundryLocal;
-	if (fl.isAvailable()) {
-		try {
-			const catalogModels = await fl.getCatalogModels();
-			if (catalogModels.length > 0) {
-				const baseUrl = await fl.ensureWebService();
-				const piModels = fl.buildPiModels(catalogModels, baseUrl);
-				modelRegistry.setFoundryLocalModels(piModels);
-			}
-		} catch {
-			// Foundry Local unavailable — continue with cloud models only
-		}
-	}
+	// Check if Foundry Local SDK is available (fast, ~50ms).
+	// Don't query catalog here — that takes ~18s due to network calls.
+	// Catalog is queried lazily when user opens /model.
+	const foundryLocalAvailable = modelRegistry.foundryLocal.isAvailable();
 
 	const settingsManager = options.settingsManager ?? SettingsManager.create(cwd, agentDir);
 	const sessionManager = options.sessionManager ?? SessionManager.create(cwd, getDefaultSessionDir(cwd, agentDir));
@@ -237,8 +226,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			model = undefined;
 		}
 		if (!model) {
-			const hasLocalModels = modelRegistry.getAvailable().some((m) => m.provider === "local");
-			if (hasLocalModels) {
+			if (foundryLocalAvailable) {
 				modelFallbackMessage = "Local models are available to download. Use /model to select one.";
 			} else {
 				modelFallbackMessage = `No models available. Use /login or set an API key environment variable. See ${join(getDocsPath(), "providers.md")}. Then use /model to select a model.`;
