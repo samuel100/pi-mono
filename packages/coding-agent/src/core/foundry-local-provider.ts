@@ -170,21 +170,21 @@ export class FoundryLocalProvider {
 			};
 
 			try {
+				// Emit start early so user sees immediate feedback during model loading
+				stream.push({ type: "start", partial: output });
+
 				const chatClient = await this.getChatClient(model.id);
 				const messages = convertContextToOpenAI(context);
 				const tools = context.tools ? convertToolsToOpenAI(context.tools) : undefined;
 
-				stream.push({ type: "start", partial: output });
-
 				let currentTextIndex = -1;
 				const toolCallAccumulators: Map<number, { id: string; name: string; args: string }> = new Map();
 
-				for await (const chunk of chatClient.completeStreamingChat(messages, tools)) {
+				const onChunk = (chunk: any) => {
 					const choice = chunk.choices?.[0];
-					if (!choice) continue;
+					if (!choice) return;
 					const delta = choice.delta;
 
-					// Text content
 					if (delta?.content) {
 						if (currentTextIndex === -1) {
 							output.content.push({ type: "text", text: "" });
@@ -203,7 +203,6 @@ export class FoundryLocalProvider {
 						});
 					}
 
-					// Tool calls
 					if (delta?.tool_calls) {
 						if (currentTextIndex !== -1) {
 							const textBlock = output.content[currentTextIndex];
@@ -217,7 +216,6 @@ export class FoundryLocalProvider {
 							}
 							currentTextIndex = -1;
 						}
-
 						for (const tc of delta.tool_calls) {
 							const idx = tc.index ?? 0;
 							if (!toolCallAccumulators.has(idx)) {
@@ -257,7 +255,6 @@ export class FoundryLocalProvider {
 						}
 					}
 
-					// Finish
 					if (choice.finish_reason) {
 						if (currentTextIndex !== -1) {
 							const textBlock = output.content[currentTextIndex];
@@ -270,7 +267,6 @@ export class FoundryLocalProvider {
 								});
 							}
 						}
-
 						for (const [, acc] of toolCallAccumulators) {
 							let parsedArgs = {};
 							try {
@@ -288,7 +284,6 @@ export class FoundryLocalProvider {
 								stream.push({ type: "toolcall_end", contentIndex: contentIdx, toolCall: tc, partial: output });
 							}
 						}
-
 						output.stopReason =
 							choice.finish_reason === "tool_calls"
 								? "toolUse"
@@ -303,6 +298,13 @@ export class FoundryLocalProvider {
 						output.usage.totalTokens = chunk.usage.total_tokens ?? output.usage.input + output.usage.output;
 						calculateCost(model, output.usage);
 					}
+				};
+
+				// SDK uses callback-based streaming: completeStreamingChat(messages, [tools], callback)
+				if (tools) {
+					await chatClient.completeStreamingChat(messages, tools, onChunk);
+				} else {
+					await chatClient.completeStreamingChat(messages, onChunk);
 				}
 
 				stream.push({ type: "done", reason: output.stopReason as "stop" | "length" | "toolUse", message: output });
