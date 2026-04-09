@@ -173,19 +173,39 @@ export class FoundryLocalProvider {
 				// Emit start early so user sees immediate feedback during model loading
 				stream.push({ type: "start", partial: output });
 
+				// Show loading indicator if model needs to be loaded into memory
+				const needsLoad = !this.loadedChatClients.has(model.id);
+				if (needsLoad) {
+					output.content.push({ type: "text", text: "" });
+					const loadingIdx = output.content.length - 1;
+					stream.push({ type: "text_start", contentIndex: loadingIdx, partial: output });
+					const loadingMsg = `Loading ${model.id} into memory...`;
+					(output.content[loadingIdx] as any).text = loadingMsg;
+					stream.push({ type: "text_delta", contentIndex: loadingIdx, delta: loadingMsg, partial: output });
+				}
+
 				const chatClient = await this.getChatClient(model.id);
+
+				// Clear loading message and reset content for actual response
+				if (needsLoad) {
+					output.content = [];
+				}
+
 				const messages = convertContextToOpenAI(context);
 				const tools = context.tools ? convertToolsToOpenAI(context.tools) : undefined;
 
 				let currentTextIndex = -1;
+				let textBuffer = "";
+				let insideToolCallTag = false;
 				const toolCallAccumulators: Map<number, { id: string; name: string; args: string }> = new Map();
 
-				const onChunk = (chunk: any) => {
-					const choice = chunk.choices?.[0];
-					if (!choice) return;
-					const delta = choice.delta;
-
-					if (delta?.content) {
+				const flushTextBuffer = () => {
+					if (!textBuffer) return;
+					// Filter out <tool_call> tags and their JSON content
+					const cleaned = textBuffer
+						.replace(/<tool_call>[\s\S]*?<\/tool_call>/g, "")
+						.replace(/<tool_call>[\s\S]*/g, ""); // partial tag at end
+					if (cleaned.trim()) {
 						if (currentTextIndex === -1) {
 							output.content.push({ type: "text", text: "" });
 							currentTextIndex = output.content.length - 1;
@@ -193,17 +213,39 @@ export class FoundryLocalProvider {
 						}
 						const textBlock = output.content[currentTextIndex];
 						if (textBlock.type === "text") {
-							textBlock.text += delta.content;
+							textBlock.text += cleaned;
 						}
-						stream.push({
-							type: "text_delta",
-							contentIndex: currentTextIndex,
-							delta: delta.content,
-							partial: output,
-						});
+						stream.push({ type: "text_delta", contentIndex: currentTextIndex, delta: cleaned, partial: output });
+					}
+					textBuffer = "";
+				};
+
+				const onChunk = (chunk: any) => {
+					const choice = chunk.choices?.[0];
+					if (!choice) return;
+					const delta = choice.delta;
+
+					if (delta?.content) {
+						textBuffer += delta.content;
+						// Detect <tool_call> tags — suppress text until </tool_call>
+						if (textBuffer.includes("<tool_call>")) {
+							insideToolCallTag = true;
+						}
+						if (insideToolCallTag) {
+							if (textBuffer.includes("</tool_call>")) {
+								insideToolCallTag = false;
+								// Clear the tool call text entirely — the SDK will deliver
+								// the parsed tool_calls via delta.tool_calls
+								textBuffer = textBuffer.replace(/<tool_call>[\s\S]*?<\/tool_call>/g, "");
+							}
+							// Don't flush while inside a tool call tag
+							return;
+						}
+						flushTextBuffer();
 					}
 
 					if (delta?.tool_calls) {
+						flushTextBuffer();
 						if (currentTextIndex !== -1) {
 							const textBlock = output.content[currentTextIndex];
 							if (textBlock.type === "text") {
@@ -256,6 +298,7 @@ export class FoundryLocalProvider {
 					}
 
 					if (choice.finish_reason) {
+						flushTextBuffer();
 						if (currentTextIndex !== -1) {
 							const textBlock = output.content[currentTextIndex];
 							if (textBlock.type === "text") {
