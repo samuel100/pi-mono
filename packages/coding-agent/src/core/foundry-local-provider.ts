@@ -40,6 +40,8 @@ export class FoundryLocalProvider {
 	private sdkManager: any = null;
 	private catalogAliases: Set<string> = new Set();
 	private webServiceUrl: string | null = null;
+	private webServicePromise: Promise<string> | null = null;
+	private loadingPromise: Promise<void> | null = null;
 
 	isAvailable(): boolean {
 		if (this.sdkAvailable !== null) return this.sdkAvailable;
@@ -59,55 +61,68 @@ export class FoundryLocalProvider {
 
 	// ── SDK manager ──────────────────────────────────────────────────────
 
+	/**
+	 * Why dup/dup2?
+	 *
+	 * The Foundry Local SDK's native ONNX Runtime core prints
+	 * "Service configuration complete." by writing directly to file
+	 * descriptor 1 (stdout) from C++ code.  This bypasses Node.js
+	 * entirely — overriding process.stdout.write has no effect.
+	 *
+	 * To suppress it we use POSIX fd manipulation via koffi (already
+	 * a Pi dependency for Windows VT input):
+	 *   1. dup(1)        → duplicate fd 1 into a new fd (savedFd)
+	 *   2. dup2(null, 1) → point fd 1 at /dev/null (mutes native writes)
+	 *   3. create the manager (native init writes to fd 1 → /dev/null)
+	 *   4. dup2(saved, 1)→ restore fd 1 to the real terminal
+	 *   5. close(savedFd)→ release the duplicate
+	 *
+	 * The finally block guarantees savedFd is always closed, even if
+	 * manager creation throws.
+	 */
 	private async getOrCreateManager(): Promise<any> {
 		if (this.sdkManager) return this.sdkManager;
 		const { FoundryLocalManager } = await import("foundry-local-sdk");
 		const fs = await import("node:fs");
 
-		// The native core writes directly to fd 1 (bypassing Node.js).
-		// Redirect the file descriptor to /dev/null during init.
 		let savedFd = -1;
-		let restored = false;
+		let closeFd: (fd: number) => number = () => 0;
+		let dup2Fn: (oldFd: number, newFd: number) => number = () => 0;
+
 		try {
 			const koffi = cjsRequire("koffi");
 			const libName = process.platform === "darwin" ? "libSystem.dylib" : "libc.so.6";
 			const libc = koffi.load(libName);
 			const dup: (fd: number) => number = libc.func("int dup(int)");
-			const dup2: (oldFd: number, newFd: number) => number = libc.func("int dup2(int, int)");
-			const closeFd: (fd: number) => number = libc.func("int close(int)");
+			dup2Fn = libc.func("int dup2(int, int)");
+			closeFd = libc.func("int close(int)");
 
 			savedFd = dup(1);
 			const nullFd = fs.openSync("/dev/null", "w");
-			dup2(nullFd, 1);
+			dup2Fn(nullFd, 1);
 			fs.closeSync(nullFd);
 
 			this.sdkManager = FoundryLocalManager.create({
 				appName: "pi-foundry-local",
 				logLevel: "fatal",
 			});
-
-			dup2(savedFd, 1);
-			closeFd(savedFd);
-			restored = true;
 		} catch {
-			// Restore fd if init failed after redirect
-			if (savedFd !== -1 && !restored) {
-				try {
-					const koffi = cjsRequire("koffi");
-					const libName = process.platform === "darwin" ? "libSystem.dylib" : "libc.so.6";
-					const libc = koffi.load(libName);
-					libc.func("int dup2(int, int)")(savedFd, 1);
-					libc.func("int close(int)")(savedFd);
-				} catch {
-					/* best effort */
-				}
-			}
-			// Fallback if dup2 approach fails entirely
+			// Fallback: create manager without fd suppression
 			if (!this.sdkManager) {
 				this.sdkManager = FoundryLocalManager.create({
 					appName: "pi-foundry-local",
 					logLevel: "fatal",
 				});
+			}
+		} finally {
+			// Always restore stdout and close the saved fd
+			if (savedFd !== -1) {
+				try {
+					dup2Fn(savedFd, 1);
+					closeFd(savedFd);
+				} catch {
+					/* best effort — fd may leak, but Pi still works */
+				}
 			}
 		}
 		return this.sdkManager;
@@ -118,19 +133,31 @@ export class FoundryLocalProvider {
 	/**
 	 * Ensure the embedded web service is running.
 	 * Returns the base URL (e.g., "http://127.0.0.1:54321").
+	 * Promise-cached so concurrent callers share one startup.
 	 */
 	async ensureWebService(): Promise<string> {
 		if (this.webServiceUrl) return this.webServiceUrl;
-		const manager = await this.getOrCreateManager();
-		if (!manager.isWebServiceRunning) {
-			manager.startWebService();
+		if (this.webServicePromise) return this.webServicePromise;
+
+		this.webServicePromise = (async () => {
+			const manager = await this.getOrCreateManager();
+			if (!manager.isWebServiceRunning) {
+				manager.startWebService();
+			}
+			const urls: string[] = manager.urls;
+			if (!urls || urls.length === 0) {
+				throw new Error("Failed to start Foundry Local web service");
+			}
+			this.webServiceUrl = urls[0];
+			return this.webServiceUrl;
+		})();
+
+		try {
+			return await this.webServicePromise;
+		} catch (e) {
+			this.webServicePromise = null;
+			throw e;
 		}
-		const urls: string[] = manager.urls;
-		if (!urls || urls.length === 0) {
-			throw new Error("Failed to start Foundry Local web service");
-		}
-		this.webServiceUrl = urls[0];
-		return this.webServiceUrl;
 	}
 
 	// ── Catalog + Download ───────────────────────────────────────────────
@@ -174,12 +201,28 @@ export class FoundryLocalProvider {
 
 	// ── Model load / unload ──────────────────────────────────────────────
 
+	/**
+	 * Load a model, serializing concurrent requests so we never
+	 * unload + load in parallel (which could leave the service
+	 * with zero models loaded).
+	 */
 	async loadModel(alias: string): Promise<void> {
+		while (this.loadingPromise) {
+			await this.loadingPromise;
+		}
+		this.loadingPromise = this._loadModelImpl(alias);
+		try {
+			await this.loadingPromise;
+		} finally {
+			this.loadingPromise = null;
+		}
+	}
+
+	private async _loadModelImpl(alias: string): Promise<void> {
 		const manager = await this.getOrCreateManager();
 		(manager.catalog as any).lastFetch = 0;
 		const model = await manager.catalog.getModel(alias);
 		if (!(await model.isLoaded())) {
-			// Unload any previously loaded models to free memory
 			await this.unloadAll();
 			process.stderr.write(`\x1b[33mLoading ${alias} into memory...\x1b[0m\n`);
 			await model.load();
