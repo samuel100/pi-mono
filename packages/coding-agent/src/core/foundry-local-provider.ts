@@ -62,18 +62,53 @@ export class FoundryLocalProvider {
 	private async getOrCreateManager(): Promise<any> {
 		if (this.sdkManager) return this.sdkManager;
 		const { FoundryLocalManager } = await import("foundry-local-sdk");
-		const origStdout = process.stdout.write;
-		const origStderr = process.stderr.write;
-		process.stdout.write = (() => true) as any;
-		process.stderr.write = (() => true) as any;
+		const fs = await import("node:fs");
+
+		// The native core writes directly to fd 1 (bypassing Node.js).
+		// Redirect the file descriptor to /dev/null during init.
+		let savedFd = -1;
+		let restored = false;
 		try {
+			const koffi = cjsRequire("koffi");
+			const libName = process.platform === "darwin" ? "libSystem.dylib" : "libc.so.6";
+			const libc = koffi.load(libName);
+			const dup: (fd: number) => number = libc.func("int dup(int)");
+			const dup2: (oldFd: number, newFd: number) => number = libc.func("int dup2(int, int)");
+			const closeFd: (fd: number) => number = libc.func("int close(int)");
+
+			savedFd = dup(1);
+			const nullFd = fs.openSync("/dev/null", "w");
+			dup2(nullFd, 1);
+			fs.closeSync(nullFd);
+
 			this.sdkManager = FoundryLocalManager.create({
 				appName: "pi-foundry-local",
 				logLevel: "fatal",
 			});
-		} finally {
-			process.stdout.write = origStdout;
-			process.stderr.write = origStderr;
+
+			dup2(savedFd, 1);
+			closeFd(savedFd);
+			restored = true;
+		} catch {
+			// Restore fd if init failed after redirect
+			if (savedFd !== -1 && !restored) {
+				try {
+					const koffi = cjsRequire("koffi");
+					const libName = process.platform === "darwin" ? "libSystem.dylib" : "libc.so.6";
+					const libc = koffi.load(libName);
+					libc.func("int dup2(int, int)")(savedFd, 1);
+					libc.func("int close(int)")(savedFd);
+				} catch {
+					/* best effort */
+				}
+			}
+			// Fallback if dup2 approach fails entirely
+			if (!this.sdkManager) {
+				this.sdkManager = FoundryLocalManager.create({
+					appName: "pi-foundry-local",
+					logLevel: "fatal",
+				});
+			}
 		}
 		return this.sdkManager;
 	}

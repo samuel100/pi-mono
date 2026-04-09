@@ -304,27 +304,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				const baseUrl = await fl.ensureWebService();
 				await fl.loadModel(model.id);
 				model = { ...model, baseUrl: `${baseUrl}/v1` };
-				const innerStream = streamSimple(model, context, { ...options, apiKey: "foundry-local" });
-
-				// Clean <tool_call> tags from the final message so they don't persist
-				// in conversation history. These tags appear as text content alongside
-				// proper tool_calls when Foundry Local models make tool calls.
-				const origResult = innerStream.result.bind(innerStream);
-				innerStream.result = async () => {
-					const msg = await origResult();
-					for (const block of msg.content) {
-						if (block.type === "text") {
-							block.text = block.text
-								.replace(/<tool_call>[\s\S]*?<\/tool_call>/g, "")
-								.replace(/<tool_call>[\s\S]*/g, "")
-								.trim();
-						}
-					}
-					msg.content = msg.content.filter((b) => b.type !== "text" || b.text.trim() !== "");
-					return msg;
-				};
-
-				return innerStream;
+				return streamSimple(model, context, { ...options, apiKey: "foundry-local" });
 			}
 			const auth = await modelRegistry.getApiKeyAndHeaders(model);
 			if (!auth.ok) {
