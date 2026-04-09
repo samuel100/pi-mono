@@ -297,10 +297,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		},
 		convertToLlm: convertToLlmWithBlockImages,
 		streamFn: async (model, context, options) => {
-			// For Foundry Local models, use native SDK streaming (no HTTP)
+			// For Foundry Local models, ensure web service is running and model is loaded,
+			// then use Pi's standard openai-completions streaming via HTTP
 			if (model.provider === "foundry-local") {
 				const fl = modelRegistry.foundryLocal;
-				return fl.streamChat(model, context, options);
+				const baseUrl = await fl.ensureWebService();
+				await fl.loadModel(model.id);
+				model = { ...model, baseUrl: `${baseUrl}/v1` };
+				return streamSimple(model, context, { ...options, apiKey: "foundry-local" });
 			}
 			const auth = await modelRegistry.getApiKeyAndHeaders(model);
 			if (!auth.ok) {

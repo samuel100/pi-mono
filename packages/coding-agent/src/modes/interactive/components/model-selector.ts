@@ -193,7 +193,8 @@ export class ModelSelectorComponent extends Container implements Focusable {
 				const registeredIds = new Set(models.filter((m) => m.provider === FOUNDRY_LOCAL_PROVIDER).map((m) => m.id));
 				for (const info of catalogModels) {
 					if (!registeredIds.has(info.alias)) {
-						const piModels = fl.buildPiModels([info]);
+						const baseUrl = fl.getBaseUrl() ?? "http://127.0.0.1:5273";
+						const piModels = fl.buildPiModels([info], baseUrl);
 						if (piModels.length > 0) {
 							models.push({
 								provider: FOUNDRY_LOCAL_PROVIDER,
@@ -435,11 +436,12 @@ export class ModelSelectorComponent extends Container implements Focusable {
 
 					this.setStatusText(`Loading ${model.id}...`);
 					this.tui.requestRender();
+					const baseUrl = await fl.ensureWebService();
 					await fl.loadModel(model.id);
 
 					localInfo.isCached = true;
 
-					const piModels = fl.buildPiModels([localInfo]);
+					const piModels = fl.buildPiModels([localInfo], baseUrl);
 					if (piModels.length > 0) {
 						this.modelRegistry.setFoundryLocalModels(piModels);
 						const registeredModel = this.modelRegistry.find(FOUNDRY_LOCAL_PROVIDER, model.id);
@@ -460,17 +462,19 @@ export class ModelSelectorComponent extends Container implements Focusable {
 			return;
 		}
 
-		// For cached local models, load in-process and select
+		// For cached local models, ensure web service and load
 		if (isLocal) {
 			const fl = this.modelRegistry.foundryLocal;
 			(async () => {
 				try {
 					this.setStatusText(`Loading ${model.id}...`);
 					this.tui.requestRender();
+					const baseUrl = await fl.ensureWebService();
 					await fl.loadModel(model.id);
 
-					this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
-					this.onSelectCallback(model);
+					const updatedModel = { ...model, baseUrl: `${baseUrl}/v1` };
+					this.settingsManager.setDefaultModelAndProvider(updatedModel.provider, updatedModel.id);
+					this.onSelectCallback(updatedModel);
 				} catch (error) {
 					this.setStatusText(
 						theme.fg("error", `Failed: ${error instanceof Error ? error.message : String(error)}`),

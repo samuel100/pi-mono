@@ -1,24 +1,17 @@
 /**
- * Foundry Local provider — in-process SDK integration.
+ * Foundry Local provider — in-process SDK with embedded web server.
  *
  * Architecture:
- *   - FoundryLocalManager runs in the Pi process (no separate service).
+ *   - FoundryLocalManager runs in the Pi process.
  *   - SDK handles catalog discovery, model download, load/unload.
- *   - Native chatClient.completeStreamingChat() for inference (no HTTP).
- *   - Models stay loaded for the duration of the Pi TUI session.
+ *   - Embedded web server (startWebService) provides OpenAI-compatible
+ *     HTTP endpoint for streaming inference — this integrates naturally
+ *     with Node.js event loop for smooth token-by-token rendering.
+ *   - Everything dies when Pi quits. No separate process, no lockfile.
  */
 
 import { createRequire } from "node:module";
-import type {
-	AssistantMessage,
-	AssistantMessageEventStream,
-	Context,
-	Model,
-	OpenAICompletionsCompat,
-	SimpleStreamOptions,
-	ToolCall,
-} from "@mariozechner/pi-ai";
-import { calculateCost, createAssistantMessageEventStream } from "@mariozechner/pi-ai";
+import type { Model, OpenAICompletionsCompat } from "@mariozechner/pi-ai";
 
 const cjsRequire = createRequire(import.meta.url);
 
@@ -46,7 +39,7 @@ export class FoundryLocalProvider {
 	private sdkAvailable: boolean | null = null;
 	private sdkManager: any = null;
 	private catalogAliases: Set<string> = new Set();
-	private loadedChatClients: Map<string, any> = new Map();
+	private webServiceUrl: string | null = null;
 
 	isAvailable(): boolean {
 		if (this.sdkAvailable !== null) return this.sdkAvailable;
@@ -59,13 +52,16 @@ export class FoundryLocalProvider {
 		return this.sdkAvailable;
 	}
 
+	/** Get the web service base URL, or null if not started. */
+	getBaseUrl(): string | null {
+		return this.webServiceUrl;
+	}
+
 	// ── SDK manager ──────────────────────────────────────────────────────
 
 	private async getOrCreateManager(): Promise<any> {
 		if (this.sdkManager) return this.sdkManager;
 		const { FoundryLocalManager } = await import("foundry-local-sdk");
-		// Suppress native core's init log that corrupts the TUI.
-		// The log goes to stdout despite logLevel: "fatal".
 		const origStdout = process.stdout.write;
 		const origStderr = process.stderr.write;
 		process.stdout.write = (() => true) as any;
@@ -80,6 +76,26 @@ export class FoundryLocalProvider {
 			process.stderr.write = origStderr;
 		}
 		return this.sdkManager;
+	}
+
+	// ── Web service (in-process, for streaming inference) ─────────────────
+
+	/**
+	 * Ensure the embedded web service is running.
+	 * Returns the base URL (e.g., "http://127.0.0.1:54321").
+	 */
+	async ensureWebService(): Promise<string> {
+		if (this.webServiceUrl) return this.webServiceUrl;
+		const manager = await this.getOrCreateManager();
+		if (!manager.isWebServiceRunning) {
+			manager.startWebService();
+		}
+		const urls: string[] = manager.urls;
+		if (!urls || urls.length === 0) {
+			throw new Error("Failed to start Foundry Local web service");
+		}
+		this.webServiceUrl = urls[0];
+		return this.webServiceUrl;
 	}
 
 	// ── Catalog + Download ───────────────────────────────────────────────
@@ -118,13 +134,14 @@ export class FoundryLocalProvider {
 		}
 	}
 
-	// ── Model load / unload (in-process) ─────────────────────────────────
+	// ── Model load / unload ──────────────────────────────────────────────
 
 	async loadModel(alias: string): Promise<void> {
 		const manager = await this.getOrCreateManager();
 		(manager.catalog as any).lastFetch = 0;
 		const model = await manager.catalog.getModel(alias);
 		if (!(await model.isLoaded())) {
+			process.stderr.write(`\x1b[33mLoading ${alias} into memory...\x1b[0m\n`);
 			await model.load();
 		}
 	}
@@ -151,12 +168,15 @@ export class FoundryLocalProvider {
 	}
 
 	/**
-	 * Unload all loaded models and clean up resources.
+	 * Unload all loaded models and stop web service.
 	 * Call on Pi shutdown to prevent OGA memory leaks.
 	 */
 	async cleanup(): Promise<void> {
 		if (!this.sdkManager) return;
 		try {
+			if (this.sdkManager.isWebServiceRunning) {
+				this.sdkManager.stopWebService();
+			}
 			const loadedModels = await this.sdkManager.catalog.getLoadedModels();
 			for (const model of loadedModels) {
 				try {
@@ -168,198 +188,18 @@ export class FoundryLocalProvider {
 		} catch {
 			// Ignore errors during cleanup
 		}
-		this.loadedChatClients.clear();
-	}
-
-	// ── Streaming inference (native FFI) ─────────────────────────────────
-
-	streamChat(model: Model<any>, context: Context, _options?: SimpleStreamOptions): AssistantMessageEventStream {
-		const stream = createAssistantMessageEventStream();
-
-		(async () => {
-			const output: AssistantMessage = {
-				role: "assistant",
-				content: [],
-				api: model.api,
-				provider: model.provider,
-				model: model.id,
-				usage: {
-					input: 0,
-					output: 0,
-					cacheRead: 0,
-					cacheWrite: 0,
-					totalTokens: 0,
-					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-				},
-				stopReason: "stop",
-				timestamp: Date.now(),
-			};
-
-			try {
-				stream.push({ type: "start", partial: output });
-
-				// Show loading indicator directly via stderr (synchronous) because
-				// model.load() is a blocking FFI call that prevents TUI rendering
-				const needsLoad = !this.loadedChatClients.has(model.id);
-				if (needsLoad) {
-					process.stderr.write(`\x1b[33mLoading ${model.id} into memory...\x1b[0m\n`);
-				}
-
-				const chatClient = await this.getChatClient(model.id);
-
-				const messages = convertContextToOpenAI(context);
-				const tools = context.tools ? convertToolsToOpenAI(context.tools) : undefined;
-
-				let currentTextIndex = -1;
-				let fullText = "";
-				const toolCallAccumulators: Map<number, { id: string; name: string; args: string }> = new Map();
-
-				const onChunk = (chunk: any) => {
-					const choice = chunk.choices?.[0];
-					if (!choice) return;
-					const delta = choice.delta;
-
-					if (delta?.content) {
-						fullText += delta.content;
-					}
-
-					if (delta?.tool_calls) {
-						if (currentTextIndex !== -1) {
-							const textBlock = output.content[currentTextIndex];
-							if (textBlock.type === "text") {
-								stream.push({
-									type: "text_end",
-									contentIndex: currentTextIndex,
-									content: textBlock.text,
-									partial: output,
-								});
-							}
-							currentTextIndex = -1;
-						}
-						for (const tc of delta.tool_calls) {
-							const idx = tc.index ?? 0;
-							if (!toolCallAccumulators.has(idx)) {
-								toolCallAccumulators.set(idx, {
-									id: tc.id ?? `call_${idx}`,
-									name: tc.function?.name ?? "",
-									args: "",
-								});
-								output.content.push({
-									type: "toolCall",
-									id: tc.id ?? `call_${idx}`,
-									name: tc.function?.name ?? "",
-									arguments: {},
-								});
-								stream.push({
-									type: "toolcall_start",
-									contentIndex: output.content.length - 1,
-									partial: output,
-								});
-							}
-							const acc = toolCallAccumulators.get(idx)!;
-							if (tc.function?.name) acc.name = tc.function.name;
-							if (tc.function?.arguments) {
-								acc.args += tc.function.arguments;
-								const contentIdx = output.content.findIndex(
-									(c) => c.type === "toolCall" && (c as ToolCall).id === acc.id,
-								);
-								if (contentIdx !== -1) {
-									stream.push({
-										type: "toolcall_delta",
-										contentIndex: contentIdx,
-										delta: tc.function.arguments,
-										partial: output,
-									});
-								}
-							}
-						}
-					}
-
-					if (choice.finish_reason) {
-						// Emit all accumulated text as a single block
-						const cleaned = fullText
-							.replace(/<tool_call>[\s\S]*?<\/tool_call>/g, "")
-							.replace(/<tool_call>[\s\S]*/g, "");
-						if (cleaned.trim()) {
-							output.content.unshift({ type: "text", text: cleaned });
-							currentTextIndex = 0;
-							stream.push({ type: "text_start", contentIndex: 0, partial: output });
-							stream.push({ type: "text_delta", contentIndex: 0, delta: cleaned, partial: output });
-							stream.push({ type: "text_end", contentIndex: 0, content: cleaned, partial: output });
-						}
-						for (const [, acc] of toolCallAccumulators) {
-							let parsedArgs = {};
-							try {
-								parsedArgs = JSON.parse(acc.args);
-							} catch {
-								/* empty */
-							}
-							const contentIdx = output.content.findIndex(
-								(c) => c.type === "toolCall" && (c as ToolCall).id === acc.id,
-							);
-							if (contentIdx !== -1) {
-								const tc = output.content[contentIdx] as ToolCall;
-								tc.name = acc.name;
-								tc.arguments = parsedArgs;
-								stream.push({ type: "toolcall_end", contentIndex: contentIdx, toolCall: tc, partial: output });
-							}
-						}
-						output.stopReason =
-							choice.finish_reason === "tool_calls"
-								? "toolUse"
-								: choice.finish_reason === "length"
-									? "length"
-									: "stop";
-					}
-
-					if (chunk.usage) {
-						output.usage.input = chunk.usage.prompt_tokens ?? 0;
-						output.usage.output = chunk.usage.completion_tokens ?? 0;
-						output.usage.totalTokens = chunk.usage.total_tokens ?? output.usage.input + output.usage.output;
-						calculateCost(model, output.usage);
-					}
-				};
-
-				// SDK uses callback-based streaming: completeStreamingChat(messages, [tools], callback)
-				if (tools) {
-					await chatClient.completeStreamingChat(messages, tools, onChunk);
-				} else {
-					await chatClient.completeStreamingChat(messages, onChunk);
-				}
-
-				stream.push({ type: "done", reason: output.stopReason as "stop" | "length" | "toolUse", message: output });
-				stream.end(output);
-			} catch (error) {
-				output.stopReason = "error";
-				output.errorMessage = error instanceof Error ? error.message : String(error);
-				stream.push({ type: "error", reason: "error", error: output });
-				stream.end(output);
-			}
-		})();
-
-		return stream;
-	}
-
-	private async getChatClient(alias: string): Promise<any> {
-		if (this.loadedChatClients.has(alias)) return this.loadedChatClients.get(alias)!;
-		const manager = await this.getOrCreateManager();
-		(manager.catalog as any).lastFetch = 0;
-		const model = await manager.catalog.getModel(alias);
-		if (!(await model.isLoaded())) await model.load();
-		const client = model.createChatClient();
-		this.loadedChatClients.set(alias, client);
-		return client;
+		this.webServiceUrl = null;
 	}
 
 	// ── Pi model mapping ─────────────────────────────────────────────────
 
-	buildPiModels(catalogModels: LocalModelInfo[]): Model<"openai-completions">[] {
+	buildPiModels(catalogModels: LocalModelInfo[], baseUrl: string): Model<"openai-completions">[] {
 		return catalogModels.map((m) => ({
 			id: m.alias,
 			name: `${m.displayName} (Foundry Local)`,
 			api: "openai-completions" as const,
 			provider: FOUNDRY_LOCAL_PROVIDER,
-			baseUrl: "local://foundry",
+			baseUrl: `${baseUrl}/v1`,
 			reasoning: false,
 			input: ["text" as const],
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -368,66 +208,4 @@ export class FoundryLocalProvider {
 			compat: FOUNDRY_LOCAL_COMPAT,
 		}));
 	}
-}
-
-// ── Context conversion helpers ───────────────────────────────────────────
-
-function convertContextToOpenAI(context: Context): any[] {
-	const messages: any[] = [];
-	if (context.systemPrompt) {
-		messages.push({ role: "system", content: context.systemPrompt });
-	}
-	for (const msg of context.messages) {
-		if (msg.role === "user") {
-			const content =
-				typeof msg.content === "string"
-					? msg.content
-					: msg.content
-							.filter((c) => c.type === "text")
-							.map((c) => (c as any).text)
-							.join("\n");
-			messages.push({ role: "user", content: content || "." });
-		} else if (msg.role === "assistant") {
-			const textParts = msg.content.filter((c) => c.type === "text");
-			const toolCalls = msg.content.filter((c) => c.type === "toolCall") as ToolCall[];
-			const textContent = textParts.length > 0 ? textParts.map((c) => (c as any).text).join("") : "";
-			const assistantMsg: any = {
-				role: "assistant",
-				content: textContent || ".",
-			};
-			if (toolCalls.length > 0) {
-				assistantMsg.tool_calls = toolCalls.map((tc) => ({
-					id: tc.id,
-					type: "function",
-					function: { name: tc.name, arguments: JSON.stringify(tc.arguments) },
-				}));
-			}
-			messages.push(assistantMsg);
-		} else if (msg.role === "toolResult") {
-			const content = msg.content
-				.filter((c) => c.type === "text")
-				.map((c) => (c as any).text)
-				.join("\n");
-			messages.push({
-				role: "tool",
-				tool_call_id: msg.toolCallId,
-				content: content || (msg.isError ? "Error" : "OK"),
-			});
-		}
-	}
-	// SDK validation requires every message to have non-empty string content
-	// that passes trim() check. Use "." as a minimal non-whitespace placeholder.
-	for (const msg of messages) {
-		if (!msg.content || (typeof msg.content === "string" && msg.content.trim() === "")) {
-			msg.content = ".";
-		}
-	}
-	return messages;
-}
-
-function convertToolsToOpenAI(tools: any[]): any[] {
-	return tools.map((tool) => ({
-		type: "function",
-		function: { name: tool.name, description: tool.description, parameters: tool.parameters },
-	}));
 }
