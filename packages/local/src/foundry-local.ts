@@ -85,6 +85,7 @@ export class FoundryLocalManager {
 	 */
 	private async getOrCreateManager(): Promise<any> {
 		if (this.sdkManager) return this.sdkManager;
+		// @ts-expect-error -- foundry-local-sdk ships without type declarations
 		const { FoundryLocalManager: FLManager } = await import("foundry-local-sdk");
 		const fs = await import("node:fs");
 
