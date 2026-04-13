@@ -535,6 +535,7 @@ export class ModelRegistry {
 	 * Get API key for a model.
 	 */
 	hasConfiguredAuth(model: Model<Api>): boolean {
+		if (this.registeredProviders.get(model.provider)?.noAuth) return true;
 		return (
 			this.authStorage.hasAuth(model.provider) ||
 			this.providerRequestConfigs.get(model.provider)?.apiKey !== undefined
@@ -577,6 +578,10 @@ export class ModelRegistry {
 	 * Get API key and request headers for a model.
 	 */
 	async getApiKeyAndHeaders(model: Model<Api>): Promise<ResolvedRequestAuth> {
+		// noAuth providers (local runtimes) don't need API keys
+		if (this.registeredProviders.get(model.provider)?.noAuth) {
+			return { ok: true, apiKey: "local", headers: undefined };
+		}
 		try {
 			const providerConfig = this.providerRequestConfigs.get(model.provider);
 			const apiKeyFromAuthStorage = await this.authStorage.getApiKey(model.provider, { includeFallback: false });
@@ -678,7 +683,7 @@ export class ModelRegistry {
 		if (!config.baseUrl) {
 			throw new Error(`Provider ${providerName}: "baseUrl" is required when defining models.`);
 		}
-		if (!config.apiKey && !config.oauth) {
+		if (!config.apiKey && !config.oauth && !config.noAuth) {
 			throw new Error(`Provider ${providerName}: "apiKey" or "oauth" is required when defining models.`);
 		}
 
@@ -785,4 +790,6 @@ export interface ProviderConfigInput {
 		headers?: Record<string, string>;
 		compat?: Model<Api>["compat"];
 	}>;
+	/** If true, skip API key requirement for this provider. Used by local runtimes. */
+	noAuth?: boolean;
 }

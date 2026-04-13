@@ -1,11 +1,13 @@
 import { join } from "node:path";
 import { Agent, type AgentMessage, type ThinkingLevel } from "@mariozechner/pi-agent-core";
 import { type Message, type Model, streamSimple } from "@mariozechner/pi-ai";
+import { LifecycleManager } from "@mariozechner/pi-local";
 import { getAgentDir, getDocsPath } from "../config.js";
 import { AgentSession } from "./agent-session.js";
 import { AuthStorage } from "./auth-storage.js";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.js";
 import type { ExtensionRunner, LoadExtensionsResult, SessionStartEvent, ToolDefinition } from "./extensions/index.js";
+import { registerLocalModels } from "./local-model-service.js";
 import { convertToLlm } from "./messages.js";
 import { ModelRegistry } from "./model-registry.js";
 import { findInitialModel } from "./model-resolver.js";
@@ -82,6 +84,8 @@ export interface CreateAgentSessionResult {
 	extensionsResult: LoadExtensionsResult;
 	/** Warning if session was restored with a different model than saved */
 	modelFallbackMessage?: string;
+	/** Lifecycle manager for local model providers (Foundry Local, Ollama, etc.) */
+	lifecycleManager: LifecycleManager;
 }
 
 // Re-exports
@@ -96,6 +100,7 @@ export type {
 	SlashCommandSource,
 	ToolDefinition,
 } from "./extensions/index.js";
+export type { ModelLifecycleInfo, ModelLifecycleProvider } from "./lifecycle-types.js";
 export type { PromptTemplate } from "./prompt-templates.js";
 export type { Skill } from "./skills.js";
 export type { Tool } from "./tools/index.js";
@@ -177,6 +182,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const authStorage = options.authStorage ?? AuthStorage.create(authPath);
 	const modelRegistry = options.modelRegistry ?? ModelRegistry.create(authStorage, modelsPath);
 
+	// Create lifecycle manager for local model providers (empty until /local is used)
+	const lifecycleManager = new LifecycleManager();
+	// Wire discovery events to model registry registration
+	lifecycleManager.onModelsDiscovered((providerName, descriptors) => {
+		registerLocalModels(modelRegistry, providerName, descriptors);
+	});
+
 	const settingsManager = options.settingsManager ?? SettingsManager.create(cwd, agentDir);
 	const sessionManager = options.sessionManager ?? SessionManager.create(cwd, getDefaultSessionDir(cwd, agentDir));
 
@@ -217,7 +229,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		});
 		model = result.model;
 		if (!model) {
-			modelFallbackMessage = `No models available. Use /login or set an API key environment variable. See ${join(getDocsPath(), "providers.md")}. Then use /model to select a model.`;
+			modelFallbackMessage = `No models available. Use /login or set an API key environment variable. Use /local for local models. See ${join(getDocsPath(), "providers.md")}. Then use /model to select a model.`;
 		} else if (modelFallbackMessage) {
 			modelFallbackMessage += `. Using ${model.provider}/${model.id}`;
 		}
@@ -297,6 +309,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		},
 		convertToLlm: convertToLlmWithBlockImages,
 		streamFn: async (model, context, options) => {
+			// Prepare local model if needed (starts web service, loads model)
+			const prepResult = await lifecycleManager.prepare(model.provider, model.id);
+			if (prepResult) {
+				model = { ...model, baseUrl: prepResult.baseUrl };
+			}
 			const auth = await modelRegistry.getApiKeyAndHeaders(model);
 			if (!auth.ok) {
 				throw new Error(auth.error);
@@ -360,5 +377,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		session,
 		extensionsResult,
 		modelFallbackMessage,
+		lifecycleManager,
 	};
 }

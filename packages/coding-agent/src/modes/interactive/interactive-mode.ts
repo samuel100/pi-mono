@@ -9,6 +9,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
 import type { AssistantMessage, ImageContent, Message, Model, OAuthProviderId } from "@mariozechner/pi-ai";
+import type { LifecycleManager, LocalProviderLifecycle } from "@mariozechner/pi-local";
+import { createFoundryLocalProvider, createOllamaProvider } from "@mariozechner/pi-local";
 import type {
 	AutocompleteItem,
 	EditorComponent,
@@ -145,6 +147,8 @@ export interface InteractiveModeOptions {
 	initialMessages?: string[];
 	/** Force verbose startup (overrides quietStartup setting) */
 	verbose?: boolean;
+	/** Lifecycle manager for local models (Foundry Local, Ollama, etc.) */
+	lifecycleProvider?: LifecycleManager;
 }
 
 export class InteractiveMode {
@@ -2197,6 +2201,11 @@ export class InteractiveMode {
 				this.editor.setText("");
 				return;
 			}
+			if (text === "/local") {
+				this.editor.setText("");
+				await this.handleLocalCommand();
+				return;
+			}
 			if (text === "/new") {
 				this.editor.setText("");
 				await this.handleClearCommand();
@@ -2855,6 +2864,11 @@ export class InteractiveMode {
 		this.isShuttingDown = true;
 		await this.runtimeHost.dispose();
 
+		// Dispose local model lifecycle providers (Foundry Local web service, etc.)
+		if (this.options.lifecycleProvider) {
+			await this.options.lifecycleProvider.dispose().catch(() => {});
+		}
+
 		// Wait for any pending renders to complete
 		// requestRender() uses process.nextTick(), so we wait one tick
 		await new Promise((resolve) => process.nextTick(resolve));
@@ -3486,6 +3500,85 @@ export class InteractiveMode {
 		this.showModelSelector(searchTerm);
 	}
 
+	private async handleLocalCommand(): Promise<void> {
+		const provider = this.options.lifecycleProvider;
+		if (!provider) {
+			this.showStatus("No lifecycle manager available");
+			return;
+		}
+
+		// Build list of known local providers and check availability
+		const knownProviders: { name: string; providerName: string; factory: () => LocalProviderLifecycle }[] = [];
+		const flProvider = createFoundryLocalProvider();
+		if (flProvider.isAvailable()) {
+			knownProviders.push({
+				name: "Foundry Local",
+				providerName: flProvider.providerName,
+				factory: () => flProvider,
+			});
+		}
+		const ollamaProvider = createOllamaProvider();
+		if (ollamaProvider.isAvailable()) {
+			knownProviders.push({
+				name: "Ollama",
+				providerName: ollamaProvider.providerName,
+				factory: () => ollamaProvider,
+			});
+		}
+
+		if (knownProviders.length === 0) {
+			this.showStatus("No local model providers available on this platform");
+			return;
+		}
+
+		// Build display names with "(connected)" label for already-registered providers
+		const displayNames = knownProviders.map((p) => {
+			const connected = provider.isProviderRegistered(p.providerName);
+			return connected ? `${p.name} (connected)` : p.name;
+		});
+
+		// Add "Add all" option when multiple providers are available
+		if (knownProviders.length > 1) {
+			displayNames.push("Add all");
+		}
+
+		const selected = await this.showExtensionSelector("Select a local provider", displayNames);
+		if (!selected) return;
+
+		// Determine which providers to register
+		let toRegister: typeof knownProviders;
+		if (selected === "Add all") {
+			toRegister = knownProviders;
+		} else {
+			// Strip "(connected)" suffix for matching
+			const baseName = selected.replace(" (connected)", "");
+			const chosen = knownProviders.find((p) => p.name === baseName);
+			if (!chosen) return;
+			toRegister = [chosen];
+		}
+
+		// Register and discover each selected provider
+		const results: string[] = [];
+		for (const entry of toRegister) {
+			const newProvider = entry.factory();
+			provider.addProvider(newProvider);
+
+			this.showStatus(`Discovering ${entry.name} models...`);
+			this.ui.requestRender();
+
+			try {
+				await provider.discoverForProvider(newProvider.providerName);
+				results.push(entry.name);
+			} catch (error) {
+				this.showError(`${entry.name}: ${error instanceof Error ? error.message : String(error)}`);
+			}
+		}
+
+		if (results.length > 0) {
+			this.showStatus(`${results.join(", ")} models discovered. Use /model to select one.`);
+		}
+	}
+
 	private async findExactModelMatch(searchTerm: string): Promise<Model<any> | undefined> {
 		const models = await this.getModelCandidates();
 		return findExactModelReferenceMatch(searchTerm, models);
@@ -3537,6 +3630,7 @@ export class InteractiveMode {
 					this.ui.requestRender();
 				},
 				initialSearchInput,
+				this.options.lifecycleProvider,
 			);
 			return { component: selector, focus: selector };
 		});

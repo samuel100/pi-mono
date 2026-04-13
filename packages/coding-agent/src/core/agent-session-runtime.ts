@@ -1,5 +1,6 @@
 import { copyFileSync, existsSync, mkdirSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
+import type { LifecycleManager } from "@mariozechner/pi-local";
 import type { AgentSession } from "./agent-session.js";
 import type { AgentSessionRuntimeDiagnostic, AgentSessionServices } from "./agent-session-services.js";
 import type { SessionStartEvent } from "./extensions/index.js";
@@ -58,6 +59,7 @@ export class AgentSessionRuntime {
 		private readonly createRuntime: CreateAgentSessionRuntimeFactory,
 		private _diagnostics: AgentSessionRuntimeDiagnostic[] = [],
 		private _modelFallbackMessage?: string,
+		private _lifecycleManager?: LifecycleManager,
 	) {}
 
 	get services(): AgentSessionServices {
@@ -78,6 +80,10 @@ export class AgentSessionRuntime {
 
 	get modelFallbackMessage(): string | undefined {
 		return this._modelFallbackMessage;
+	}
+
+	get lifecycleManager(): LifecycleManager | undefined {
+		return this._lifecycleManager;
 	}
 
 	private async emitBeforeSwitch(
@@ -123,6 +129,7 @@ export class AgentSessionRuntime {
 		this._services = result.services;
 		this._diagnostics = result.diagnostics;
 		this._modelFallbackMessage = result.modelFallbackMessage;
+		this._lifecycleManager = result.lifecycleManager;
 	}
 
 	async switchSession(sessionPath: string, cwdOverride?: string): Promise<{ cancelled: boolean }> {
@@ -316,6 +323,7 @@ export async function createAgentSessionRuntime(
 		createRuntime,
 		result.diagnostics,
 		result.modelFallbackMessage,
+		result.lifecycleManager,
 	);
 }
 

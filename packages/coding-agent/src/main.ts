@@ -693,6 +693,7 @@ export async function main(args: string[]) {
 			initialImages,
 			initialMessages: parsed.messages,
 			verbose: parsed.verbose,
+			lifecycleProvider: runtime.lifecycleManager,
 		});
 		if (startupBenchmark) {
 			await interactiveMode.init();

@@ -9,6 +9,7 @@ import {
 	Text,
 	type TUI,
 } from "@mariozechner/pi-tui";
+import type { ModelLifecycleInfo, ModelLifecycleProvider } from "../../../core/lifecycle-types.js";
 import type { ModelRegistry } from "../../../core/model-registry.js";
 import type { SettingsManager } from "../../../core/settings-manager.js";
 import { theme } from "../theme/theme.js";
@@ -19,6 +20,7 @@ interface ModelItem {
 	provider: string;
 	id: string;
 	model: Model<any>;
+	lifecycleInfo?: ModelLifecycleInfo;
 }
 
 interface ScopedModelItem {
@@ -52,6 +54,7 @@ export class ModelSelectorComponent extends Container implements Focusable {
 	private currentModel?: Model<any>;
 	private settingsManager: SettingsManager;
 	private modelRegistry: ModelRegistry;
+	private lifecycleProvider?: ModelLifecycleProvider;
 	private onSelectCallback: (model: Model<any>) => void;
 	private onCancelCallback: () => void;
 	private errorMessage?: string;
@@ -70,6 +73,7 @@ export class ModelSelectorComponent extends Container implements Focusable {
 		onSelect: (model: Model<any>) => void,
 		onCancel: () => void,
 		initialSearchInput?: string,
+		lifecycleProvider?: ModelLifecycleProvider,
 	) {
 		super();
 
@@ -77,6 +81,7 @@ export class ModelSelectorComponent extends Container implements Focusable {
 		this.currentModel = currentModel;
 		this.settingsManager = settingsManager;
 		this.modelRegistry = modelRegistry;
+		this.lifecycleProvider = lifecycleProvider;
 		this.scopedModels = scopedModels;
 		this.scope = scopedModels.length > 0 ? "scoped" : "all";
 		this.onSelectCallback = onSelect;
@@ -140,6 +145,11 @@ export class ModelSelectorComponent extends Container implements Focusable {
 		// Refresh to pick up any changes to models.json
 		this.modelRegistry.refresh();
 
+		// Discover lifecycle models (Foundry Local, Ollama, etc.)
+		if (this.lifecycleProvider) {
+			await this.lifecycleProvider.ensureDiscovered();
+		}
+
 		// Check for models.json errors
 		const loadError = this.modelRegistry.getError();
 		if (loadError) {
@@ -149,11 +159,15 @@ export class ModelSelectorComponent extends Container implements Focusable {
 		// Load available models (built-in models still work even if models.json failed)
 		try {
 			const availableModels = await this.modelRegistry.getAvailable();
-			models = availableModels.map((model: Model<any>) => ({
-				provider: model.provider,
-				id: model.id,
-				model,
-			}));
+			models = availableModels.map((model: Model<any>) => {
+				const info = this.lifecycleProvider?.getInfo(model.provider, model.id);
+				return {
+					provider: model.provider,
+					id: model.id,
+					model,
+					lifecycleInfo: info,
+				};
+			});
 		} catch (error) {
 			this.allModels = [];
 			this.scopedModelItems = [];
@@ -182,12 +196,26 @@ export class ModelSelectorComponent extends Container implements Focusable {
 
 	private sortModels(models: ModelItem[]): ModelItem[] {
 		const sorted = [...models];
-		// Sort: current model first, then by provider
+		const statusRank = (item: ModelItem): number => {
+			if (!item.lifecycleInfo) return 2; // cloud models in middle
+			switch (item.lifecycleInfo.status) {
+				case "loaded":
+					return 0;
+				case "cached":
+					return 1;
+				case "available":
+					return 3;
+				default:
+					return 2;
+			}
+		};
 		sorted.sort((a, b) => {
 			const aIsCurrent = modelsAreEqual(this.currentModel, a.model);
 			const bIsCurrent = modelsAreEqual(this.currentModel, b.model);
 			if (aIsCurrent && !bIsCurrent) return -1;
 			if (!aIsCurrent && bIsCurrent) return 1;
+			const rankDiff = statusRank(a) - statusRank(b);
+			if (rankDiff !== 0) return rankDiff;
 			return a.provider.localeCompare(b.provider);
 		});
 		return sorted;
@@ -244,18 +272,35 @@ export class ModelSelectorComponent extends Container implements Focusable {
 			const isSelected = i === this.selectedIndex;
 			const isCurrent = modelsAreEqual(this.currentModel, item.model);
 
+			// Build status suffix for lifecycle models
+			let statusSuffix = "";
+			if (item.lifecycleInfo) {
+				const info = item.lifecycleInfo;
+				switch (info.status) {
+					case "loaded":
+						statusSuffix = theme.fg("success", " (loaded)");
+						break;
+					case "cached":
+						statusSuffix = theme.fg("muted", " (cached)");
+						break;
+					case "available":
+						statusSuffix = theme.fg("warning", ` (download${info.downloadSize ? ` ${info.downloadSize}` : ""})`);
+						break;
+				}
+			}
+
 			let line = "";
 			if (isSelected) {
-				const prefix = theme.fg("accent", "→ ");
+				const prefix = theme.fg("accent", "-> ");
 				const modelText = `${item.id}`;
 				const providerBadge = theme.fg("muted", `[${item.provider}]`);
-				const checkmark = isCurrent ? theme.fg("success", " ✓") : "";
-				line = `${prefix + theme.fg("accent", modelText)} ${providerBadge}${checkmark}`;
+				const checkmark = isCurrent ? theme.fg("success", " *") : "";
+				line = `${prefix + theme.fg("accent", modelText)} ${providerBadge}${checkmark}${statusSuffix}`;
 			} else {
 				const modelText = `  ${item.id}`;
 				const providerBadge = theme.fg("muted", `[${item.provider}]`);
-				const checkmark = isCurrent ? theme.fg("success", " ✓") : "";
-				line = `${modelText} ${providerBadge}${checkmark}`;
+				const checkmark = isCurrent ? theme.fg("success", " *") : "";
+				line = `${modelText} ${providerBadge}${checkmark}${statusSuffix}`;
 			}
 
 			this.listContainer.addChild(new Text(line, 0, 0));
@@ -326,9 +371,63 @@ export class ModelSelectorComponent extends Container implements Focusable {
 	}
 
 	private handleSelect(model: Model<any>): void {
+		const item = this.filteredModels[this.selectedIndex];
+		if (item?.lifecycleInfo?.status === "available" && this.lifecycleProvider) {
+			this.downloadAndSelect(item);
+			return;
+		}
+		if (item?.lifecycleInfo && this.lifecycleProvider) {
+			this.prepareAndSelect(item);
+			return;
+		}
 		// Save as new default
 		this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
 		this.onSelectCallback(model);
+	}
+
+	private prepareAndSelect(item: ModelItem): void {
+		if (!this.lifecycleProvider) return;
+
+		this.listContainer.clear();
+		this.listContainer.addChild(new Text(theme.fg("accent", `  Loading ${item.id}...`), 0, 0));
+		this.tui.requestRender();
+
+		this.lifecycleProvider
+			.prepare(item.provider, item.id)
+			.then(() => {
+				this.settingsManager.setDefaultModelAndProvider(item.provider, item.id);
+				this.onSelectCallback(item.model);
+			})
+			.catch((error: unknown) => {
+				this.errorMessage = `Failed to load model: ${error instanceof Error ? error.message : String(error)}`;
+				this.updateList();
+				this.tui.requestRender();
+			});
+	}
+
+	private downloadAndSelect(item: ModelItem): void {
+		if (!this.lifecycleProvider) return;
+
+		this.listContainer.clear();
+		this.listContainer.addChild(new Text(theme.fg("accent", `  Downloading ${item.id}...`), 0, 0));
+		const progressText = new Text(theme.fg("muted", "  0%"), 0, 0);
+		this.listContainer.addChild(progressText);
+		this.tui.requestRender();
+
+		this.lifecycleProvider
+			.download(item.provider, item.id, (percent: number) => {
+				progressText.setText(theme.fg("muted", `  ${Math.round(percent)}%`));
+				this.tui.requestRender();
+			})
+			.then(() => {
+				this.settingsManager.setDefaultModelAndProvider(item.provider, item.id);
+				this.onSelectCallback(item.model);
+			})
+			.catch((error: unknown) => {
+				this.errorMessage = `Download failed: ${error instanceof Error ? error.message : String(error)}`;
+				this.updateList();
+				this.tui.requestRender();
+			});
 	}
 
 	getSearchInput(): Input {
